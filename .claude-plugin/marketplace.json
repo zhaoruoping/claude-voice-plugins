@@ -1,0 +1,17 @@
+{
+  "name": "claude-voice-plugins",
+  "owner": {
+    "name": "zhaoruoping"
+  },
+  "metadata": {
+    "description": "Claude Code Telegram channel with voice STT/TTS support"
+  },
+  "plugins": [
+    {
+      "name": "telegram-voice",
+      "description": "Telegram channel for Claude Code with DashScope STT and MiniMax TTS voice support",
+      "source": "./plugins/telegram-voice",
+      "category": "messaging"
+    }
+  ]
+}
