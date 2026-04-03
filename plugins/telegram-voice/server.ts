@@ -412,7 +412,8 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    const text = `🔐 Permission: ${tool_name}`
+    const preview = input_preview ? `\n📋 ${input_preview.slice(0, 300)}` : ''
+    const text = `🔐 Permission: ${tool_name}${description ? `\n${description}` : ''}${preview}`
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
