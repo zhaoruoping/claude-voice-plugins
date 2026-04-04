@@ -64,6 +64,71 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
+// ── Delivery log ────────────────────────────────────────────────────────
+// Structured pipeline tracing: receive → STT → queue/deliver → ack.
+// Each message gets a monotonic seq_id for correlation across log lines.
+let _logSeq = 0
+function dlog(seq: number, stage: string, detail?: string): void {
+  const ts = new Date().toISOString()
+  const extra = detail ? ` | ${detail}` : ''
+  process.stderr.write(`[delivery] #${seq} ${ts} ${stage}${extra}\n`)
+}
+
+// ── Message queue ───────────────────────────────────────────────────────
+// Claude processes one inbound message at a time. If a new message arrives
+// while the previous one hasn't been acknowledged (via reply/react/edit),
+// queue it and deliver when Claude responds.
+type QueuedMessage = {
+  seq: number
+  notification: { method: string; params: any }
+}
+const messageQueue: QueuedMessage[] = []
+let claudeBusy = false
+let busySince = 0
+const BUSY_TIMEOUT_MS = 5 * 60 * 1000 // 5 min fallback
+
+function deliverNext(): void {
+  if (messageQueue.length === 0) {
+    claudeBusy = false
+    return
+  }
+  const next = messageQueue.shift()!
+  dlog(next.seq, 'dequeue', `queue_remaining=${messageQueue.length}`)
+  deliverToMcp(next)
+}
+
+function deliverToMcp(entry: QueuedMessage): void {
+  claudeBusy = true
+  busySince = Date.now()
+  dlog(entry.seq, 'deliver_to_claude')
+  mcp.notification(entry.notification).catch(err => {
+    dlog(entry.seq, 'deliver_failed', String(err))
+    // Don't block the queue on delivery failure
+    claudeBusy = false
+    deliverNext()
+  })
+}
+
+function enqueueOrDeliver(seq: number, notification: { method: string; params: any }): void {
+  const entry: QueuedMessage = { seq, notification }
+  // If Claude has been "busy" for too long, assume the ack was lost and force-deliver
+  if (claudeBusy && (Date.now() - busySince) > BUSY_TIMEOUT_MS) {
+    dlog(seq, 'busy_timeout', `busy_for=${((Date.now() - busySince) / 1000).toFixed(0)}s, force_delivering`)
+    claudeBusy = false
+  }
+  if (claudeBusy) {
+    messageQueue.push(entry)
+    dlog(seq, 'queued', `queue_size=${messageQueue.length}`)
+  } else {
+    deliverToMcp(entry)
+  }
+}
+
+// Called by reply/react/voice_reply/edit tool handlers to signal Claude is done
+function ackMessage(): void {
+  deliverNext()
+}
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -584,6 +649,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        ackMessage()
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -591,6 +657,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
+        ackMessage()
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'voice_reply': {
@@ -631,6 +698,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         try { unlinkSync(oggPath) } catch {}
         try { unlinkSync(oggPath.replace(/\.ogg$/, '.mp3')) } catch {}
         if (!sendData.ok) throw new Error(`sendVoice failed: ${JSON.stringify(sendData)}`)
+        ackMessage()
         return { content: [{ type: 'text', text: `sent (id: ${sendData.result.message_id})` }] }
       }
       case 'download_attachment': {
@@ -662,6 +730,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
+        ackMessage()
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
       default:
@@ -860,9 +929,14 @@ bot.on('message:document', async ctx => {
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   let text = ctx.message.caption ?? '(voice message)'
+  let sttFailed = false
+  const sttSeq = ++_logSeq
+
+  dlog(sttSeq, 'voice_received', `file_id=${voice.file_id}, size=${voice.file_size}`)
 
   // Auto-transcribe voice messages using local SenseVoice STT
   try {
+    dlog(sttSeq, 'stt_start', 'provider=dashscope')
     const file = await bot.api.getFile(voice.file_id)
     if (file.file_path) {
       const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
@@ -881,12 +955,34 @@ bot.on('message:voice', async ctx => {
         if (result.status === 0 && result.stdout) {
           const lines = result.stdout.trim().split('\n')
           const transcription = lines[lines.length - 1]
-          if (transcription) text = transcription
+          if (transcription && transcription.trim().length > 0) {
+            text = transcription
+            dlog(sttSeq, 'stt_success', `chars=${transcription.length}`)
+          } else {
+            sttFailed = true
+            dlog(sttSeq, 'stt_empty', 'transcription returned empty')
+          }
+        } else {
+          sttFailed = true
+          dlog(sttSeq, 'stt_error', `exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
         }
+      } else {
+        sttFailed = true
+        dlog(sttSeq, 'stt_download_failed', `http=${res.status}`)
       }
+    } else {
+      sttFailed = true
+      dlog(sttSeq, 'stt_no_file_path', 'Telegram returned no file_path')
     }
   } catch (err) {
-    process.stderr.write(`telegram channel: voice STT failed: ${err}\n`)
+    sttFailed = true
+    dlog(sttSeq, 'stt_exception', String(err))
+  }
+
+  // STT failure fallback: still deliver to Claude so the bot responds
+  if (sttFailed && text === (ctx.message.caption ?? '(voice message)')) {
+    text = '[语音转写失败] 收到一条语音消息，但自动转写未成功。请用户重新发送语音或改用文字。'
+    dlog(sttSeq, 'stt_fallback', 'delivering failure notice to Claude')
   }
 
   await handleInbound(ctx, text, undefined, {
@@ -1015,11 +1111,14 @@ async function handleInbound(
       .catch(() => {})
   }
 
+  const seq = ++_logSeq
+  dlog(seq, 'received', `chat=${chat_id} msg=${msgId} type=${attachment?.kind ?? 'text'} len=${text.length}`)
+
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
+  const notification = {
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -1039,9 +1138,9 @@ async function handleInbound(
         } : {}),
       },
     },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  }
+
+  enqueueOrDeliver(seq, notification)
 }
 
 // Without this, any throw in a message handler stops polling permanently
