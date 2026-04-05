@@ -68,7 +68,29 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // When enabled, calls DashScope (qwen-turbo) to classify whether a message
 // is a new task or a follow-up. For new tasks, prepends a memory-recall
 // prompt so Claude checks relevant memories before executing.
-let memoryEnhancementEnabled = false
+// Global config file shared by all bots — one toggle affects all instances.
+const MEMORY_ENHANCE_CONFIG = join(process.cwd(), 'bots', 'memory_enhance.json')
+
+function loadMemoryEnhanceEnabled(): boolean {
+  try {
+    const raw = readFileSync(MEMORY_ENHANCE_CONFIG, 'utf8')
+    return JSON.parse(raw).enabled === true
+  } catch {
+    return false
+  }
+}
+
+function saveMemoryEnhanceEnabled(enabled: boolean): void {
+  try {
+    const dir = join(process.cwd(), 'bots')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(MEMORY_ENHANCE_CONFIG, JSON.stringify({ enabled }, null, 2) + '\n')
+  } catch (err) {
+    process.stderr.write(`[memory-enhance] failed to save config: ${err}\n`)
+  }
+}
+
+let memoryEnhancementEnabled = loadMemoryEnhanceEnabled()
 const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY ?? ''
 const DASHSCOPE_MODEL = 'qwen-turbo'
 const recentMessages: { role: 'user' | 'assistant'; content: string }[] = []
@@ -1196,15 +1218,18 @@ async function handleInbound(
   const seq = ++_logSeq
   dlog(seq, 'received', `chat=${chat_id} msg=${msgId} type=${attachment?.kind ?? 'text'} len=${text.length}`)
 
-  // ── Toggle memory enhancement ──
+  // ── Toggle memory enhancement (global config file) ──
   const toggle = isToggleCommand(text)
   if (toggle) {
     memoryEnhancementEnabled = toggle === 'on'
+    saveMemoryEnhanceEnabled(memoryEnhancementEnabled)
     const status = memoryEnhancementEnabled ? '已开启' : '已关闭'
-    await bot.api.sendMessage(chat_id, `🧠 记忆增强${status}`)
-    dlog(seq, 'memory_enhance_toggle', status)
+    await bot.api.sendMessage(chat_id, `🧠 记忆增强${status}（全局，所有 bot 生效）`)
+    dlog(seq, 'memory_enhance_toggle', `${status} (saved to ${MEMORY_ENHANCE_CONFIG})`)
     return // don't forward toggle commands to Claude
   }
+  // Re-read global config each message (another bot may have toggled it)
+  memoryEnhancementEnabled = loadMemoryEnhanceEnabled()
 
   // ── Memory enhancement: classify & prepend ──
   let enhancedText = text
