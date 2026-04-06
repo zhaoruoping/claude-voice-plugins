@@ -1280,7 +1280,7 @@ async function handleInbound(
     if (classification.is_new_task) {
       enhancedText = MEMORY_RECALL_PROMPT + text
       // Notify user what was injected
-      const notifyText = `[记忆增强] 检测到新任务：${classification.task_summary}\n已注入记忆检索提示词`
+      const notifyText = `[记忆增强] 检测到新任务：${classification.task_summary}\n\n已注入提示词：\n${MEMORY_RECALL_PROMPT.replace(/<\/?memory-recall-prompt>/g, '').trim()}`
       void bot.api.sendMessage(chat_id, notifyText).catch(() => {})
       dlog(seq, 'memory_enhance_injected', classification.task_summary)
     }
