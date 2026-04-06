@@ -239,7 +239,7 @@ function chatLog(role: 'USER' | 'BOT', text: string): void {
   try { appendFileSync(CHAT_LOG_FILE, line) } catch {}
 }
 
-// ── Message delivery ───────────────────────���────────────────────────────
+// ── Message delivery ────────────────────────────────────────────────────
 // Deliver messages immediately to Claude Code. Claude Code has its own
 // native message queue that handles timing when busy.
 
