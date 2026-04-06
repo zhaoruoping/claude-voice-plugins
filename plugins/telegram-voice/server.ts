@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -171,6 +171,15 @@ function dlog(seq: number, stage: string, detail?: string): void {
   const ts = new Date().toISOString()
   const extra = detail ? ` | ${detail}` : ''
   process.stderr.write(`[delivery] #${seq} ${ts} ${stage}${extra}\n`)
+}
+
+// ── Chat log (TG conversation history) ─────────────────────────────────
+// Persists user↔bot text exchanges to a log file per bot instance.
+const CHAT_LOG_FILE = join(STATE_DIR, 'chat_history.log')
+function chatLog(role: 'USER' | 'BOT', text: string): void {
+  const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+  const line = `[${ts}] [${role}] ${text.replace(/\n/g, '\\n')}\n`
+  try { appendFileSync(CHAT_LOG_FILE, line) } catch {}
 }
 
 // ── Message queue ───────────────────────────────────────────────────────
@@ -748,6 +757,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        chatLog('BOT', text)
         // Track assistant reply for memory enhancement context
         if (memoryEnhancementEnabled) {
           recentMessages.push({ role: 'assistant', content: text.slice(0, 300) })
@@ -802,6 +812,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         try { unlinkSync(oggPath) } catch {}
         try { unlinkSync(oggPath.replace(/\.ogg$/, '.mp3')) } catch {}
         if (!sendData.ok) throw new Error(`sendVoice failed: ${JSON.stringify(sendData)}`)
+        chatLog('BOT', `[voice] ${text}`)
         ackMessage()
         return { content: [{ type: 'text', text: `sent (id: ${sendData.result.message_id})` }] }
       }
@@ -1217,6 +1228,7 @@ async function handleInbound(
 
   const seq = ++_logSeq
   dlog(seq, 'received', `chat=${chat_id} msg=${msgId} type=${attachment?.kind ?? 'text'} len=${text.length}`)
+  chatLog('USER', text)
 
   // ── Toggle memory enhancement (global config file) ──
   const toggle = isToggleCommand(text)
