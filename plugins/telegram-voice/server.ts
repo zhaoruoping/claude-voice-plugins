@@ -85,10 +85,26 @@ const _projectDir = process.env.CLAUDE_PROJECT_DIR
   })()
 const MEMORY_ENHANCE_CONFIG = join(_projectDir, 'bots', 'memory_enhance.json')
 
+// Per-bot memory enhancement config.
+// Format: { "default": true/false, "overrides": { "telegram_secretary": false } }
+// Bot identity derived from TELEGRAM_STATE_DIR basename (e.g. "telegram4", "telegram_secretary")
+const _botIdentity = (() => {
+  const sd = process.env.TELEGRAM_STATE_DIR ?? ''
+  if (!sd) return ''
+  // Extract the last path component, e.g. "/home/user/.claude/channels/telegram_secretary" -> "telegram_secretary"
+  return sd.split(sep).filter(Boolean).pop() ?? ''
+})()
+
 function loadMemoryEnhanceEnabled(): boolean {
   try {
     const raw = readFileSync(MEMORY_ENHANCE_CONFIG, 'utf8')
-    return JSON.parse(raw).enabled === true
+    const cfg = JSON.parse(raw)
+    // Legacy format: { "enabled": true/false }
+    if ('enabled' in cfg && !('default' in cfg)) return cfg.enabled === true
+    // New format: { "default": true/false, "overrides": { "bot_id": true/false } }
+    const overrides = cfg.overrides ?? {}
+    if (_botIdentity && _botIdentity in overrides) return overrides[_botIdentity] === true
+    return cfg.default === true
   } catch {
     return false
   }
@@ -96,9 +112,23 @@ function loadMemoryEnhanceEnabled(): boolean {
 
 function saveMemoryEnhanceEnabled(enabled: boolean): void {
   try {
-    const dir = join(process.cwd(), 'bots')
-    mkdirSync(dir, { recursive: true })
-    writeFileSync(MEMORY_ENHANCE_CONFIG, JSON.stringify({ enabled }, null, 2) + '\n')
+    mkdirSync(join(_projectDir, 'bots'), { recursive: true })
+    // Read existing config, update default (or per-bot override)
+    let cfg: any = { default: enabled, overrides: {} }
+    try {
+      cfg = JSON.parse(readFileSync(MEMORY_ENHANCE_CONFIG, 'utf8'))
+      if ('enabled' in cfg && !('default' in cfg)) {
+        // Migrate legacy format
+        cfg = { default: cfg.enabled, overrides: {} }
+      }
+    } catch {}
+    if (_botIdentity) {
+      cfg.overrides = cfg.overrides ?? {}
+      cfg.overrides[_botIdentity] = enabled
+    } else {
+      cfg.default = enabled
+    }
+    writeFileSync(MEMORY_ENHANCE_CONFIG, JSON.stringify(cfg, null, 2) + '\n')
   } catch (err) {
     process.stderr.write(`[memory-enhance] failed to save config: ${err}\n`)
   }
@@ -209,60 +239,19 @@ function chatLog(role: 'USER' | 'BOT', text: string): void {
   try { appendFileSync(CHAT_LOG_FILE, line) } catch {}
 }
 
-// ── Message queue ───────────────────────────────────────────────────────
-// Claude processes one inbound message at a time. If a new message arrives
-// while the previous one hasn't been acknowledged (via reply/react/edit),
-// queue it and deliver when Claude responds.
-type QueuedMessage = {
-  seq: number
-  notification: { method: string; params: any }
-}
-const messageQueue: QueuedMessage[] = []
-let claudeBusy = false
-let busySince = 0
-const BUSY_TIMEOUT_MS = 5 * 60 * 1000 // 5 min fallback
+// ── Message delivery ───────────────────────���────────────────────────────
+// Deliver messages immediately to Claude Code. Claude Code has its own
+// native message queue that handles timing when busy.
 
-function deliverNext(): void {
-  if (messageQueue.length === 0) {
-    claudeBusy = false
-    return
-  }
-  const next = messageQueue.shift()!
-  dlog(next.seq, 'dequeue', `queue_remaining=${messageQueue.length}`)
-  deliverToMcp(next)
-}
-
-function deliverToMcp(entry: QueuedMessage): void {
-  claudeBusy = true
-  busySince = Date.now()
-  dlog(entry.seq, 'deliver_to_claude')
-  mcp.notification(entry.notification).catch(err => {
-    dlog(entry.seq, 'deliver_failed', String(err))
-    // Don't block the queue on delivery failure
-    claudeBusy = false
-    deliverNext()
+function enqueueOrDeliver(seq: number, notification: { method: string; params: any }): void {
+  dlog(seq, 'deliver_to_claude')
+  mcp.notification(notification).catch(err => {
+    dlog(seq, 'deliver_failed', String(err))
   })
 }
 
-function enqueueOrDeliver(seq: number, notification: { method: string; params: any }): void {
-  const entry: QueuedMessage = { seq, notification }
-  // If Claude has been "busy" for too long, assume the ack was lost and force-deliver
-  if (claudeBusy && (Date.now() - busySince) > BUSY_TIMEOUT_MS) {
-    dlog(seq, 'busy_timeout', `busy_for=${((Date.now() - busySince) / 1000).toFixed(0)}s, force_delivering`)
-    claudeBusy = false
-  }
-  if (claudeBusy) {
-    messageQueue.push(entry)
-    dlog(seq, 'queued', `queue_size=${messageQueue.length}`)
-  } else {
-    deliverToMcp(entry)
-  }
-}
-
-// Called by reply/react/voice_reply/edit tool handlers to signal Claude is done
-function ackMessage(): void {
-  deliverNext()
-}
+// No-op: kept for compatibility with reply/react/voice_reply/edit handlers
+function ackMessage(): void {}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
