@@ -69,7 +69,21 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // is a new task or a follow-up. For new tasks, prepends a memory-recall
 // prompt so Claude checks relevant memories before executing.
 // Global config file shared by all bots — one toggle affects all instances.
-const MEMORY_ENHANCE_CONFIG = join(process.cwd(), 'bots', 'memory_enhance.json')
+// Claude Code sets CWD to the project dir, but plugin's cwd is the plugin dir.
+// Use CLAUDE_PROJECT_DIR env var if available, fallback to common project paths.
+const _projectDir = process.env.CLAUDE_PROJECT_DIR
+  ?? (() => {
+    // Try to find bots/memory_enhance.json relative to common project dirs
+    const candidates = [
+      '/cache2/work/mcpwork/Graduation/Thesis_v0322',
+      join(homedir(), 'Thesis_v0322'),
+    ]
+    for (const d of candidates) {
+      try { readFileSync(join(d, 'bots', 'memory_enhance.json'), 'utf8'); return d } catch {}
+    }
+    return process.cwd()
+  })()
+const MEMORY_ENHANCE_CONFIG = join(_projectDir, 'bots', 'memory_enhance.json')
 
 function loadMemoryEnhanceEnabled(): boolean {
   try {
@@ -91,10 +105,22 @@ function saveMemoryEnhanceEnabled(enabled: boolean): void {
 }
 
 let memoryEnhancementEnabled = loadMemoryEnhanceEnabled()
-const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY ?? ''
+// Read DASHSCOPE_API_KEY: prefer process.env, fallback to voice/.env file
+let DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY ?? ''
+if (!DASHSCOPE_API_KEY) {
+  try {
+    const voiceEnvPath = join(homedir(), '.claude', 'voice', '.env')
+    const voiceEnvContent = readFileSync(voiceEnvPath, 'utf8')
+    const m = voiceEnvContent.match(/^DASHSCOPE_API_KEY=(.+)$/m)
+    if (m) {
+      DASHSCOPE_API_KEY = m[1].trim()
+      process.stderr.write(`[memory-enhance] loaded DASHSCOPE_API_KEY from voice/.env (${DASHSCOPE_API_KEY.slice(0,8)}...)\n`)
+    }
+  } catch {}
+}
 const DASHSCOPE_MODEL = 'qwen-turbo'
 const recentMessages: { role: 'user' | 'assistant'; content: string }[] = []
-const MAX_RECENT = 6 // keep last 6 messages for context
+const MAX_RECENT = 10 // keep last 10 messages for context
 
 const MEMORY_RECALL_PROMPT = `<memory-recall-prompt>
 注意：用户正在发起一个新任务。在执行前，请先：
@@ -116,14 +142,15 @@ function isToggleCommand(text: string): 'on' | 'off' | null {
 
 async function classifyNewTask(text: string): Promise<{ is_new_task: boolean; task_summary: string }> {
   if (!DASHSCOPE_API_KEY) {
-    process.stderr.write('[memory-enhance] DASHSCOPE_API_KEY not set, skipping classification\n')
+    chatLog('SYSTEM', '[memory-enhance] DASHSCOPE_API_KEY not set, skipping')
     return { is_new_task: false, task_summary: '' }
   }
   try {
     const contextMsgs = recentMessages.slice(-MAX_RECENT).map(m => ({
       role: m.role,
-      content: m.content.slice(0, 200), // truncate for efficiency
+      content: m.content,
     }))
+    chatLog('SYSTEM', `[memory-enhance] classifying with ${contextMsgs.length} context msgs`)
     const res = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -138,14 +165,14 @@ async function classifyNewTask(text: string): Promise<{ is_new_task: boolean; ta
             content: '你是一个消息分类器。判断用户的最新消息是"新任务"还是"对当前话题的追问/补充/回复"。新任务指用户发起了一个与之前对话不同的新工作请求。追问/补充指用户在继续当前话题，回答问题，提供补充信息，或对之前结果的追问。输出严格JSON格式：{"is_new_task": true/false, "task_summary": "简短描述"}。只输出JSON，不要其他内容。',
           },
           ...contextMsgs,
-          { role: 'user', content: `判断这条消息是否为新任务：\n\n"${text.slice(0, 500)}"` },
+          { role: 'user', content: `判断这条消息是否为新任务：\n\n"${text}"` },
         ],
         max_tokens: 100,
         temperature: 0.1,
       }),
     })
     if (!res.ok) {
-      process.stderr.write(`[memory-enhance] DashScope API error: HTTP ${res.status}\n`)
+      chatLog('SYSTEM', `[memory-enhance] DashScope API error: HTTP ${res.status}`)
       return { is_new_task: false, task_summary: '' }
     }
     const data = await res.json() as any
@@ -158,7 +185,7 @@ async function classifyNewTask(text: string): Promise<{ is_new_task: boolean; ta
       task_summary: String(parsed.task_summary ?? ''),
     }
   } catch (err) {
-    process.stderr.write(`[memory-enhance] classification failed: ${err}\n`)
+    chatLog('SYSTEM', `[memory-enhance] classification error: ${err}`)
     return { is_new_task: false, task_summary: '' }
   }
 }
@@ -760,7 +787,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         chatLog('BOT', text)
         // Track assistant reply for memory enhancement context
         if (memoryEnhancementEnabled) {
-          recentMessages.push({ role: 'assistant', content: text.slice(0, 300) })
+          recentMessages.push({ role: 'assistant', content: text })
           if (recentMessages.length > MAX_RECENT * 2) recentMessages.splice(0, recentMessages.length - MAX_RECENT)
         }
         ackMessage()
@@ -1228,7 +1255,6 @@ async function handleInbound(
 
   const seq = ++_logSeq
   dlog(seq, 'received', `chat=${chat_id} msg=${msgId} type=${attachment?.kind ?? 'text'} len=${text.length}`)
-  chatLog('USER', text)
 
   // ── Toggle memory enhancement (global config file) ──
   const toggle = isToggleCommand(text)
@@ -1236,7 +1262,7 @@ async function handleInbound(
     memoryEnhancementEnabled = toggle === 'on'
     saveMemoryEnhanceEnabled(memoryEnhancementEnabled)
     const status = memoryEnhancementEnabled ? '已开启' : '已关闭'
-    await bot.api.sendMessage(chat_id, `🧠 记忆增强${status}（全局，所有 bot 生效）`)
+    await bot.api.sendMessage(chat_id, `[记忆增强] ${status}（全局，所有 bot 生效）`)
     dlog(seq, 'memory_enhance_toggle', `${status} (saved to ${MEMORY_ENHANCE_CONFIG})`)
     return // don't forward toggle commands to Claude
   }
@@ -1246,14 +1272,15 @@ async function handleInbound(
   // ── Memory enhancement: classify & prepend ──
   let enhancedText = text
   if (memoryEnhancementEnabled && text.length > 2) {
-    dlog(seq, 'memory_enhance_classify', 'calling DashScope')
+    dlog(seq, 'memory_enhance_classify', `calling DashScope (context=${recentMessages.length} msgs)`)
     const classification = await classifyNewTask(text)
     dlog(seq, 'memory_enhance_result', `new_task=${classification.is_new_task} summary="${classification.task_summary}"`)
+    chatLog('SYSTEM', `[memory-enhance] new_task=${classification.is_new_task} summary="${classification.task_summary}"`)
 
     if (classification.is_new_task) {
       enhancedText = MEMORY_RECALL_PROMPT + text
       // Notify user what was injected
-      const notifyText = `🧠 [记忆增强] 检测到新任务：${classification.task_summary}\n已注入记忆检索提示词`
+      const notifyText = `[记忆增强] 检测到新任务：${classification.task_summary}\n已注入记忆检索提示词`
       void bot.api.sendMessage(chat_id, notifyText).catch(() => {})
       dlog(seq, 'memory_enhance_injected', classification.task_summary)
     }
@@ -1261,6 +1288,9 @@ async function handleInbound(
     recentMessages.push({ role: 'user', content: text })
     if (recentMessages.length > MAX_RECENT * 2) recentMessages.splice(0, recentMessages.length - MAX_RECENT)
   }
+
+  // Log the final message (after memory enhancement injection)
+  chatLog('USER', enhancedText)
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
