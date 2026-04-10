@@ -170,6 +170,48 @@ function isToggleCommand(text: string): 'on' | 'off' | null {
   return null
 }
 
+// ── Reply reminder (force bot to use reply tool, not terminal output) ──
+// Some models (especially non-Claude) tend to write replies to terminal stdout
+// instead of calling the reply tool, causing the user to see no response.
+// This injects a short reminder appended to every inbound user message.
+// Global toggle, all bots affected. Default: enabled.
+const REPLY_REMINDER_CONFIG = join(_projectDir, 'bots', 'telegram_reply_reminder.json')
+
+const REPLY_REMINDER_PROMPT = `
+
+[SYSTEM REMINDER] You are running as a Telegram channel bot. To respond to the user, you MUST call the tool \`mcp__plugin_telegram-voice_telegram__reply\` (or \`mcp__plugin_telegram-voice_telegram__voice_reply\`) with the chat_id from the inbound channel tag. Plain terminal output is INVISIBLE to the user — only tool calls reach Telegram.`
+
+const REPLY_REMINDER_TOGGLE_ON = ['开启回复提醒', '打开回复提醒', 'enable reply reminder']
+const REPLY_REMINDER_TOGGLE_OFF = ['关闭回复提醒', '停止回复提醒', 'disable reply reminder']
+
+function loadReplyReminderEnabled(): boolean {
+  try {
+    const raw = readFileSync(REPLY_REMINDER_CONFIG, 'utf8')
+    const cfg = JSON.parse(raw)
+    return cfg.enabled === true
+  } catch {
+    return true // default ON: this is a safety net for all bots
+  }
+}
+
+function saveReplyReminderEnabled(enabled: boolean): void {
+  try {
+    mkdirSync(join(_projectDir, 'bots'), { recursive: true })
+    writeFileSync(REPLY_REMINDER_CONFIG, JSON.stringify({ enabled }, null, 2) + '\n')
+  } catch (err) {
+    process.stderr.write(`[reply-reminder] failed to save config: ${err}\n`)
+  }
+}
+
+function isReplyReminderToggleCommand(text: string): 'on' | 'off' | null {
+  const t = text.trim().toLowerCase()
+  if (REPLY_REMINDER_TOGGLE_ON.some(p => t === p)) return 'on'
+  if (REPLY_REMINDER_TOGGLE_OFF.some(p => t === p)) return 'off'
+  return null
+}
+
+let replyReminderEnabled = loadReplyReminderEnabled()
+
 async function classifyNewTask(text: string): Promise<{ is_new_task: boolean; task_summary: string }> {
   if (!DASHSCOPE_API_KEY) {
     chatLog('SYSTEM', '[memory-enhance] DASHSCOPE_API_KEY not set, skipping')
@@ -1258,6 +1300,19 @@ async function handleInbound(
   // Re-read global config each message (another bot may have toggled it)
   memoryEnhancementEnabled = loadMemoryEnhanceEnabled()
 
+  // ── Toggle reply reminder (global config file) ──
+  const replyToggle = isReplyReminderToggleCommand(text)
+  if (replyToggle) {
+    replyReminderEnabled = replyToggle === 'on'
+    saveReplyReminderEnabled(replyReminderEnabled)
+    const status = replyReminderEnabled ? '已开启' : '已关闭'
+    await bot.api.sendMessage(chat_id, `[回复提醒] ${status}（全局，所有 bot 生效）`)
+    dlog(seq, 'reply_reminder_toggle', `${status} (saved to ${REPLY_REMINDER_CONFIG})`)
+    return // don't forward toggle commands to Claude
+  }
+  // Re-read global config each message (another bot may have toggled it)
+  replyReminderEnabled = loadReplyReminderEnabled()
+
   // ── Memory enhancement: classify & prepend ──
   let enhancedText = text
   if (memoryEnhancementEnabled && text.length > 2) {
@@ -1278,7 +1333,15 @@ async function handleInbound(
     if (recentMessages.length > MAX_RECENT * 2) recentMessages.splice(0, recentMessages.length - MAX_RECENT)
   }
 
-  // Log the final message (after memory enhancement injection)
+  // ── Reply reminder injection (append to message tail) ──
+  // Always append a system reminder telling the model to use the reply tool.
+  // Helps weak-instruction-following models that tend to write to terminal.
+  if (replyReminderEnabled) {
+    enhancedText = enhancedText + REPLY_REMINDER_PROMPT
+    dlog(seq, 'reply_reminder_injected', 'tail-appended')
+  }
+
+  // Log the final message (after all injections)
   chatLog('USER', enhancedText)
 
   const imagePath = downloadImage ? await downloadImage() : undefined
