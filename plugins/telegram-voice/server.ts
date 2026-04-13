@@ -85,6 +85,70 @@ const _projectDir = process.env.CLAUDE_PROJECT_DIR
   })()
 const MEMORY_ENHANCE_CONFIG = join(_projectDir, 'bots', 'memory_enhance.json')
 
+// ── Telegram slash command routing ──
+// Two-layer command registry: global (all bots) + task-specific (per current task).
+// Files are hot-reloaded on every message for instant updates without restart.
+const GLOBAL_COMMANDS_FILE = join(_projectDir, 'bots', 'telegram_commands_global.json')
+const BOT_REGISTRY_FILE = join(_projectDir, 'bots', 'bot_registry.json')
+
+function loadSlashCommands(): Record<string, string> {
+  const commands: Record<string, string> = {}
+  // Layer 1: global commands
+  try {
+    const raw = readFileSync(GLOBAL_COMMANDS_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as Record<string, string>
+    for (const [k, v] of Object.entries(parsed)) {
+      if (k.startsWith('/') && typeof v === 'string') commands[k] = v
+    }
+  } catch {}
+  // Layer 2: task-specific commands (overrides global on collision)
+  try {
+    const reg = JSON.parse(readFileSync(BOT_REGISTRY_FILE, 'utf8'))
+    const stateDir = process.env.TELEGRAM_STATE_DIR ?? ''
+    // Find current bot by matching state_dir
+    for (const bot of Object.values(reg.bots ?? {}) as any[]) {
+      const botDir = bot.state_dir ?? ''
+      if (stateDir.endsWith(botDir) || stateDir.endsWith(botDir.replace(/^\.\//, ''))) {
+        const taskName = bot.current_task?.name
+        if (taskName) {
+          try {
+            const taskCmds = JSON.parse(readFileSync(
+              join(_projectDir, 'bots', 'prompts', 'tasks', `${taskName}.commands.json`), 'utf8'
+            )) as Record<string, string>
+            for (const [k, v] of Object.entries(taskCmds)) {
+              if (k.startsWith('/') && typeof v === 'string') commands[k] = v
+            }
+          } catch {}
+        }
+        break
+      }
+    }
+  } catch {}
+  return commands
+}
+
+function routeSlashCommand(text: string): { matched: boolean; command?: string; prompt?: string; args?: string } {
+  if (!text.startsWith('/')) return { matched: false }
+  const commands = loadSlashCommands()
+  // Parse: "/cmd arg1 arg2" -> command="/cmd", args="arg1 arg2"
+  const spaceIdx = text.indexOf(' ')
+  const cmd = spaceIdx === -1 ? text : text.slice(0, spaceIdx)
+  const args = spaceIdx === -1 ? '' : text.slice(spaceIdx + 1).trim()
+  // Normalize: try exact match first, then hyphen<->underscore variants
+  const prompt = commands[cmd]
+    ?? commands[cmd.replace(/-/g, '_')]
+    ?? commands[cmd.replace(/_/g, '-')]
+  if (prompt) {
+    // Replace {args} placeholder if present, otherwise append args
+    let finalPrompt = prompt
+    if (args) {
+      finalPrompt = prompt.includes('{args}') ? prompt.replace('{args}', args) : `${prompt}\n\nUser arguments: ${args}`
+    }
+    return { matched: true, command: cmd, prompt: finalPrompt, args }
+  }
+  return { matched: false }
+}
+
 // Per-bot memory enhancement config.
 // Format: { "default": true/false, "overrides": { "telegram_secretary": false } }
 // Bot identity derived from TELEGRAM_STATE_DIR basename (e.g. "telegram4", "telegram_secretary")
@@ -153,10 +217,10 @@ const recentMessages: { role: 'user' | 'assistant'; content: string }[] = []
 const MAX_RECENT = 10 // keep last 10 messages for context
 
 const MEMORY_RECALL_PROMPT = `<memory-recall-prompt>
-注意：用户正在发起一个新任务。在执行前，请先：
-(1) 检查 MEMORY.md 索引中与此任务相关的 feedback 和 reference 文件并读取关键内容
-(2) 回顾当前上下文中是否有类似操作的历史和踩坑记录
-(3) 确认已读取相关记忆后再开始执行
+Note: The user is initiating a new task. Before executing, please:
+(1) Check the MEMORY.md index for relevant feedback and reference files and read their key content
+(2) Review the current context for any history or pitfall records from similar operations
+(3) Confirm you have read the relevant memories before starting execution
 </memory-recall-prompt>
 `
 
@@ -1313,9 +1377,19 @@ async function handleInbound(
   // Re-read global config each message (another bot may have toggled it)
   replyReminderEnabled = loadReplyReminderEnabled()
 
+  // ── Slash command routing (global + task-specific) ──
+  const slashRoute = routeSlashCommand(text)
+  if (slashRoute.matched) {
+    text = slashRoute.prompt!
+    dlog(seq, 'slash_cmd_routed', `${slashRoute.command} -> ${text.slice(0, 80)}...`)
+    // Notify user that command was recognized
+    void bot.api.sendMessage(chat_id, `[Command] ${slashRoute.command}`).catch(() => {})
+  }
+
   // ── Memory enhancement: classify & prepend ──
+  // Skip classification if a slash command was routed (the prompt is synthetic, not user intent)
   let enhancedText = text
-  if (memoryEnhancementEnabled && text.length > 2) {
+  if (memoryEnhancementEnabled && text.length > 2 && !slashRoute.matched) {
     dlog(seq, 'memory_enhance_classify', `calling DashScope (context=${recentMessages.length} msgs)`)
     const classification = await classifyNewTask(text)
     dlog(seq, 'memory_enhance_result', `new_task=${classification.is_new_task} summary="${classification.task_summary}"`)
@@ -1324,7 +1398,7 @@ async function handleInbound(
     if (classification.is_new_task) {
       enhancedText = MEMORY_RECALL_PROMPT + text
       // Notify user what was injected
-      const notifyText = `[记忆增强] 检测到新任务：${classification.task_summary}\n\n已注入提示词：\n${MEMORY_RECALL_PROMPT.replace(/<\/?memory-recall-prompt>/g, '').trim()}`
+      const notifyText = `[Memory Enhancement] New task detected: ${classification.task_summary}\n\nInjected prompt:\n${MEMORY_RECALL_PROMPT.replace(/<\/?memory-recall-prompt>/g, '').trim()}`
       void bot.api.sendMessage(chat_id, notifyText).catch(() => {})
       dlog(seq, 'memory_enhance_injected', classification.task_summary)
     }
