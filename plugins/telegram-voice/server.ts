@@ -70,16 +70,19 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // prompt so Claude checks relevant memories before executing.
 // Global config file shared by all bots — one toggle affects all instances.
 // Claude Code sets CWD to the project dir, but plugin's cwd is the plugin dir.
-// Use CLAUDE_PROJECT_DIR env var if available, fallback to common project paths.
+// Detect project root: CLAUDE_PROJECT_DIR env > walk up from TELEGRAM_STATE_DIR > cwd
 const _projectDir = process.env.CLAUDE_PROJECT_DIR
   ?? (() => {
-    // Try to find bots/memory_enhance.json relative to common project dirs
-    const candidates = [
-      '/cache2/work/mcpwork/Graduation/Thesis_v0322',
-      join(homedir(), 'Thesis_v0322'),
-    ]
-    for (const d of candidates) {
-      try { readFileSync(join(d, 'bots', 'memory_enhance.json'), 'utf8'); return d } catch {}
+    const stateDir = process.env.TELEGRAM_STATE_DIR ?? ''
+    if (stateDir) {
+      let dir = stateDir
+      for (let i = 0; i < 5; i++) {
+        const parent = join(dir, '..')
+        try { var resolved = realpathSync(parent) } catch { break }
+        if (resolved === dir) break
+        dir = resolved
+        try { readFileSync(join(dir, 'bots', 'bot_registry.json'), 'utf8'); return dir } catch {}
+      }
     }
     return process.cwd()
   })()
@@ -1120,8 +1123,59 @@ bot.on('callback_query:data', async ctx => {
   }
 })
 
+// ── Long-message debouncing ──
+// Telegram splits pasted content >4096 chars into multiple messages, each
+// arriving as a separate update. Without buffering, Claude processes each
+// segment as an independent user turn, corrupting order and losing coherence.
+// Strategy: only delay messages that look like split pieces (≥4000 chars).
+// Short messages pass through immediately, preserving chat responsiveness.
+const LONG_MSG_THRESHOLD = 4000
+const BUFFER_WINDOW_MS = 2000
+
+type TextBuffer = {
+  parts: string[]
+  lastCtx: Context
+  timer: ReturnType<typeof setTimeout>
+}
+const textBuffers = new Map<string, TextBuffer>()
+
+async function flushTextBuffer(chatId: string): Promise<void> {
+  const buf = textBuffers.get(chatId)
+  if (!buf) return
+  textBuffers.delete(chatId)
+  clearTimeout(buf.timer)
+  const combined = buf.parts.join('')
+  dlog(_logSeq, 'buffer_flush', `chat=${chatId} parts=${buf.parts.length} total_len=${combined.length}`)
+  await handleInbound(buf.lastCtx, combined, undefined)
+}
+
 bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+  const chatId = String(ctx.chat!.id)
+  const text = ctx.message.text
+  const existing = textBuffers.get(chatId)
+
+  // Fast path: short message AND no pending buffer — deliver immediately
+  if (text.length < LONG_MSG_THRESHOLD && !existing) {
+    await handleInbound(ctx, text, undefined)
+    return
+  }
+
+  // Buffered path: accumulate and (re)start timer
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.parts.push(text)
+    existing.lastCtx = ctx
+    existing.timer = setTimeout(() => { void flushTextBuffer(chatId) }, BUFFER_WINDOW_MS)
+    dlog(_logSeq, 'buffer_append', `chat=${chatId} part=${existing.parts.length} len=${text.length}`)
+  } else {
+    const buf: TextBuffer = {
+      parts: [text],
+      lastCtx: ctx,
+      timer: setTimeout(() => { void flushTextBuffer(chatId) }, BUFFER_WINDOW_MS),
+    }
+    textBuffers.set(chatId, buf)
+    dlog(_logSeq, 'buffer_start', `chat=${chatId} len=${text.length}`)
+  }
 })
 
 bot.on('message:photo', async ctx => {
@@ -1463,14 +1517,23 @@ void (async () => {
         onStart: info => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
+          // Register slash commands menu: built-in + global + task-specific
+          const menuCmds: { command: string; description: string }[] = [
+            { command: 'start', description: 'Welcome and setup guide' },
+            { command: 'help', description: 'What this bot can do' },
+            { command: 'status', description: 'Check your pairing status' },
+          ]
+          try {
+            const slashCmds = loadSlashCommands()
+            for (const [cmd, prompt] of Object.entries(slashCmds)) {
+              const name = cmd.replace(/^\//, '').replace(/-/g, '_')
+              const desc = prompt.slice(0, 50) + (prompt.length > 50 ? '...' : '')
+              menuCmds.push({ command: name, description: desc })
+            }
+          } catch {}
+          void bot.api.setMyCommands(menuCmds, { scope: { type: 'all_private_chats' } }).catch(() => {})
+          void bot.api.setMyCommands(menuCmds).catch(() => {})
+          process.stderr.write(`telegram channel: registered ${menuCmds.length} menu commands\n`)
         },
       })
       return // bot.stop() was called — clean exit from the loop
