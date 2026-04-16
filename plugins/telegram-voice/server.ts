@@ -906,6 +906,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         assertAllowedChat(chat_id)
 
+        // Auto-degrade: if no MINIMAX credentials, send as text instead of
+        // throwing. This keeps the bot functional for teams that haven't
+        // configured TTS. The hint message is returned to Claude (not the
+        // end user) so Claude can prompt the user to configure the key.
+        if (!process.env.MINIMAX_API_KEY || !process.env.MINIMAX_GROUP_ID) {
+          const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id,
+              text,
+              ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+            }),
+          })
+          const data = await res.json() as any
+          if (!data.ok) throw new Error(`sendMessage fallback failed: ${JSON.stringify(data)}`)
+          chatLog('BOT', `[voice->text fallback] ${text}`)
+          ackMessage()
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `sent as text (id: ${data.result.message_id}) — ` +
+                `voice_reply degraded because MINIMAX_API_KEY and/or MINIMAX_GROUP_ID is not set. ` +
+                `To enable voice replies, add both to config/secrets.env and restart the bot.`,
+            }],
+          }
+        }
+
         // Synthesize speech using MiniMax TTS → convert to OGG Opus → send
         const ttsResult = spawnSync(
           VOICE_PYTHON,
@@ -1129,8 +1158,8 @@ bot.on('callback_query:data', async ctx => {
 // segment as an independent user turn, corrupting order and losing coherence.
 // Strategy: only delay messages that look like split pieces (≥4000 chars).
 // Short messages pass through immediately, preserving chat responsiveness.
-const LONG_MSG_THRESHOLD = 4000
-const BUFFER_WINDOW_MS = 2000
+const LONG_MSG_THRESHOLD = 3500
+const BUFFER_WINDOW_MS = 1500
 
 type TextBuffer = {
   parts: string[]
@@ -1225,55 +1254,78 @@ bot.on('message:voice', async ctx => {
 
   dlog(sttSeq, 'voice_received', `file_id=${voice.file_id}, size=${voice.file_size}`)
 
-  // Auto-transcribe voice messages using local SenseVoice STT
-  try {
-    dlog(sttSeq, 'stt_start', 'provider=dashscope')
-    const file = await bot.api.getFile(voice.file_id)
-    if (file.file_path) {
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      if (res.ok) {
-        const buf = Buffer.from(await res.arrayBuffer())
-        const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.oga`)
-        mkdirSync(INBOX_DIR, { recursive: true })
-        writeFileSync(tmpPath, buf)
-        const result = spawnSync(
-          VOICE_PYTHON,
-          [join(homedir(), '.claude/voice/transcribe.py'), '--provider', 'dashscope', tmpPath],
-          { timeout: 30000, encoding: 'utf-8' },
-        )
-        try { unlinkSync(tmpPath) } catch {}
-        if (result.status === 0 && result.stdout) {
-          const lines = result.stdout.trim().split('\n')
-          const transcription = lines[lines.length - 1]
-          if (transcription && transcription.trim().length > 0) {
-            text = transcription
-            dlog(sttSeq, 'stt_success', `chars=${transcription.length}`)
+  // Determine which STT provider is available.
+  // Order: explicit TELEGRAM_VOICE_STT_PROVIDER env var > dashscope (if key) > funasr (local fallback) > none.
+  const sttProviderEnv = process.env.TELEGRAM_VOICE_STT_PROVIDER
+  let sttProvider: 'dashscope' | 'funasr' | null = null
+  if (sttProviderEnv === 'dashscope' || sttProviderEnv === 'funasr') {
+    sttProvider = sttProviderEnv
+  } else if (DASHSCOPE_API_KEY) {
+    sttProvider = 'dashscope'
+  } else if (process.env.TELEGRAM_VOICE_ENABLE_FUNASR === '1') {
+    sttProvider = 'funasr'
+  }
+
+  if (!sttProvider) {
+    // No STT configured — degrade gracefully, tell Claude what happened.
+    sttFailed = true
+    dlog(sttSeq, 'stt_skip_no_provider', 'no DASHSCOPE_API_KEY and funasr not enabled')
+    text =
+      '[Voice message received — STT is not configured]\n' +
+      'This Telegram bot has no speech-to-text backend enabled. ' +
+      'Tell the user: 1) reply in text instead, or 2) configure an STT backend — ' +
+      'either add DASHSCOPE_API_KEY (cloud, fast, paid) to config/secrets.env, ' +
+      'or set TELEGRAM_VOICE_ENABLE_FUNASR=1 (local GPU, free, requires model download).'
+  } else {
+    try {
+      dlog(sttSeq, 'stt_start', `provider=${sttProvider}`)
+      const file = await bot.api.getFile(voice.file_id)
+      if (file.file_path) {
+        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+        const res = await fetch(url)
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer())
+          const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.oga`)
+          mkdirSync(INBOX_DIR, { recursive: true })
+          writeFileSync(tmpPath, buf)
+          const result = spawnSync(
+            VOICE_PYTHON,
+            [join(homedir(), '.claude/voice/transcribe.py'), '--provider', sttProvider, tmpPath],
+            { timeout: 30000, encoding: 'utf-8' },
+          )
+          try { unlinkSync(tmpPath) } catch {}
+          if (result.status === 0 && result.stdout) {
+            const lines = result.stdout.trim().split('\n')
+            const transcription = lines[lines.length - 1]
+            if (transcription && transcription.trim().length > 0) {
+              text = transcription
+              dlog(sttSeq, 'stt_success', `chars=${transcription.length}`)
+            } else {
+              sttFailed = true
+              dlog(sttSeq, 'stt_empty', 'transcription returned empty')
+            }
           } else {
             sttFailed = true
-            dlog(sttSeq, 'stt_empty', 'transcription returned empty')
+            dlog(sttSeq, 'stt_error', `exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
           }
         } else {
           sttFailed = true
-          dlog(sttSeq, 'stt_error', `exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
+          dlog(sttSeq, 'stt_download_failed', `http=${res.status}`)
         }
       } else {
         sttFailed = true
-        dlog(sttSeq, 'stt_download_failed', `http=${res.status}`)
+        dlog(sttSeq, 'stt_no_file_path', 'Telegram returned no file_path')
       }
-    } else {
+    } catch (err) {
       sttFailed = true
-      dlog(sttSeq, 'stt_no_file_path', 'Telegram returned no file_path')
+      dlog(sttSeq, 'stt_exception', String(err))
     }
-  } catch (err) {
-    sttFailed = true
-    dlog(sttSeq, 'stt_exception', String(err))
-  }
 
-  // STT failure fallback: still deliver to Claude so the bot responds
-  if (sttFailed && text === (ctx.message.caption ?? '(voice message)')) {
-    text = '[语音转写失败] 收到一条语音消息，但自动转写未成功。请用户重新发送语音或改用文字。'
-    dlog(sttSeq, 'stt_fallback', 'delivering failure notice to Claude')
+    // STT runtime failure fallback: still deliver to Claude so the bot responds
+    if (sttFailed && text === (ctx.message.caption ?? '(voice message)')) {
+      text = `[Voice transcription failed via ${sttProvider}] A voice message was received but could not be transcribed. Ask the user to resend or switch to text.`
+      dlog(sttSeq, 'stt_fallback', 'delivering failure notice to Claude')
+    }
   }
 
   await handleInbound(ctx, text, undefined, {
