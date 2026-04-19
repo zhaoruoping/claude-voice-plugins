@@ -1,7 +1,7 @@
 {
   "name": "telegram-voice",
   "description": "Telegram channel for Claude Code with DashScope STT and MiniMax TTS voice support",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "keywords": ["telegram", "voice", "stt", "tts", "channel", "mcp"],
   "license": "Apache-2.0"
 }

@@ -112,7 +112,7 @@ function loadSlashCommands(): Record<string, string> {
     for (const bot of Object.values(reg.bots ?? {}) as any[]) {
       const botDir = bot.state_dir ?? ''
       if (stateDir.endsWith(botDir) || stateDir.endsWith(botDir.replace(/^\.\//, ''))) {
-        const taskName = bot.current_task?.name
+        const taskName = typeof bot.current_task === 'string' ? bot.current_task : bot.current_task?.name
         if (taskName) {
           try {
             const taskCmds = JSON.parse(readFileSync(
@@ -336,7 +336,15 @@ let _logSeq = 0
 function dlog(seq: number, stage: string, detail?: string): void {
   const ts = new Date().toISOString()
   const extra = detail ? ` | ${detail}` : ''
-  process.stderr.write(`[delivery] #${seq} ${ts} ${stage}${extra}\n`)
+  const line = `[delivery] #${seq} ${ts} ${stage}${extra}\n`
+  process.stderr.write(line)
+  // STT stages additionally get persisted to a per-bot debug log so transient
+  // failures can be investigated later (stderr is ephemeral in tmux panes).
+  if (stage.startsWith('stt_') || stage === 'voice_received') {
+    try {
+      appendFileSync(join(STATE_DIR, 'stt_debug.log'), line)
+    } catch {}
+  }
 }
 
 // ── Chat log (TG conversation history) ─────────────────────────────────
@@ -1288,11 +1296,14 @@ bot.on('message:voice', async ctx => {
           const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.oga`)
           mkdirSync(INBOX_DIR, { recursive: true })
           writeFileSync(tmpPath, buf)
+          const sttStart = Date.now()
           const result = spawnSync(
             VOICE_PYTHON,
             [join(homedir(), '.claude/voice/transcribe.py'), '--provider', sttProvider, tmpPath],
-            { timeout: 30000, encoding: 'utf-8' },
+            { timeout: 60000, encoding: 'utf-8' },
           )
+          const sttMs = Date.now() - sttStart
+          dlog(sttSeq, 'stt_subprocess_done', `ms=${sttMs}, status=${result.status}, stdout_chars=${(result.stdout ?? '').length}, stderr_chars=${(result.stderr ?? '').length}`)
           try { unlinkSync(tmpPath) } catch {}
           if (result.status === 0 && result.stdout) {
             const lines = result.stdout.trim().split('\n')
