@@ -1296,28 +1296,56 @@ bot.on('message:voice', async ctx => {
           const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.oga`)
           mkdirSync(INBOX_DIR, { recursive: true })
           writeFileSync(tmpPath, buf)
-          const sttStart = Date.now()
-          const result = spawnSync(
-            VOICE_PYTHON,
-            [join(homedir(), '.claude/voice/transcribe.py'), '--provider', sttProvider, tmpPath],
-            { timeout: 60000, encoding: 'utf-8' },
-          )
-          const sttMs = Date.now() - sttStart
-          dlog(sttSeq, 'stt_subprocess_done', `ms=${sttMs}, status=${result.status}, stdout_chars=${(result.stdout ?? '').length}, stderr_chars=${(result.stderr ?? '').length}`)
+
+          // Retry loop with exponential backoff for transient STT failures
+          // (dashscope qwen3-asr-flash occasionally returns 500/429/timeout;
+          // a voice message lost to transient error is annoying for the user).
+          // Policy:
+          //   - Retry on non-zero exit (API/network/timeout error)
+          //   - Do NOT retry on exit=0 with empty stdout (audio genuinely
+          //     unrecognizable by the model — retry won't help)
+          const MAX_ATTEMPTS = 3
+          const BACKOFF_MS = [500, 1500]  // sleep before attempt 2 and 3
+          let lastResult: ReturnType<typeof spawnSync> | null = null
+          let attempt = 0
+          for (attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            const sttStart = Date.now()
+            const result = spawnSync(
+              VOICE_PYTHON,
+              [join(homedir(), '.claude/voice/transcribe.py'), '--provider', sttProvider, tmpPath],
+              { timeout: 60000, encoding: 'utf-8' },
+            )
+            const sttMs = Date.now() - sttStart
+            lastResult = result
+            dlog(sttSeq, 'stt_attempt', `n=${attempt}/${MAX_ATTEMPTS}, ms=${sttMs}, status=${result.status}, stdout_chars=${(result.stdout ?? '').length}, stderr_chars=${(result.stderr ?? '').length}`)
+            if (result.status === 0 && result.stdout && result.stdout.trim().length > 0) {
+              break  // success
+            }
+            if (result.status === 0) {
+              dlog(sttSeq, 'stt_empty_no_retry', `attempt=${attempt} empty stdout with status=0 — retrying would produce same result`)
+              break
+            }
+            if (attempt < MAX_ATTEMPTS) {
+              const backoff = BACKOFF_MS[attempt - 1]
+              dlog(sttSeq, 'stt_retry_wait', `will retry after ${backoff}ms (attempt ${attempt} failed with exit=${result.status})`)
+              await new Promise(r => setTimeout(r, backoff))
+            }
+          }
           try { unlinkSync(tmpPath) } catch {}
+          const result = lastResult!
           if (result.status === 0 && result.stdout) {
             const lines = result.stdout.trim().split('\n')
             const transcription = lines[lines.length - 1]
             if (transcription && transcription.trim().length > 0) {
               text = transcription
-              dlog(sttSeq, 'stt_success', `chars=${transcription.length}`)
+              dlog(sttSeq, 'stt_success', `chars=${transcription.length}, attempts=${attempt}`)
             } else {
               sttFailed = true
               dlog(sttSeq, 'stt_empty', 'transcription returned empty')
             }
           } else {
             sttFailed = true
-            dlog(sttSeq, 'stt_error', `exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
+            dlog(sttSeq, 'stt_error', `exhausted retries: exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
           }
         } else {
           sttFailed = true
@@ -1334,7 +1362,7 @@ bot.on('message:voice', async ctx => {
 
     // STT runtime failure fallback: still deliver to Claude so the bot responds
     if (sttFailed && text === (ctx.message.caption ?? '(voice message)')) {
-      text = `[Voice transcription failed via ${sttProvider}] A voice message was received but could not be transcribed. Ask the user to resend or switch to text.`
+      text = `[Voice transcription failed via ${sttProvider} after retries] A voice message was received but could not be transcribed. Ask the user to resend or switch to text.`
       dlog(sttSeq, 'stt_fallback', 'delivering failure notice to Claude')
     }
   }
