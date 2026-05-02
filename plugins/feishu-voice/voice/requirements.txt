@@ -1,0 +1,4 @@
+dashscope>=1.20
+openai>=1.0
+requests>=2.28
+httpx[socks]>=0.24

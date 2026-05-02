@@ -12,6 +12,12 @@
       "description": "Telegram channel for Claude Code with DashScope STT and MiniMax TTS voice support",
       "source": "./plugins/telegram-voice",
       "category": "messaging"
+    },
+    {
+      "name": "feishu-voice",
+      "description": "Feishu (\u98de\u4e66) channel for Claude Code mirroring telegram-voice; M1 text echo, voice/files to follow",
+      "source": "./plugins/feishu-voice",
+      "category": "messaging"
     }
   ]
 }
