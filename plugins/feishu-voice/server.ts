@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Feishu (飞书) channel for Claude Code — M1 skeleton.
+ * Feishu (飞书) channel for Claude Code — M1 skeleton (v0.0.2 marker comment).
  *
  * Mirrors telegram-voice/server.ts architecture. Uses Lark Node SDK WebSocket
  * long-connection (no public IP needed) for receiving messages, OpenAPI for
@@ -10,6 +10,8 @@
  * M1 scope (this file): env load + MCP server + reply tool + inbound message
  * forwarding. Voice / files / edits / reactions / slash commands / memory
  * enhance to follow in M2-M6.
+ *
+ * v0.0.2 (2026-05-02): test marker for plugin auto-update mechanism experiment.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'

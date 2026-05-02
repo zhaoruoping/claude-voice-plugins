@@ -1,7 +1,7 @@
 {
   "name": "feishu-voice",
   "description": "Feishu (飞书) channel for Claude Code with DashScope STT support, mirroring telegram-voice architecture",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "keywords": ["feishu", "lark", "voice", "stt", "channel", "mcp"],
   "license": "Apache-2.0"
 }
