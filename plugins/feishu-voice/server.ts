@@ -23,10 +23,22 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import * as Lark from '@larksuiteoapi/node-sdk'
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, unlinkSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, unlinkSync, createReadStream, statSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join, sep, extname, basename } from 'path'
+
+// Image extensions sent as msg_type='image' (Feishu accepts these for image upload)
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.tiff', '.bmp', '.ico'])
+// Map non-image extensions to Feishu's file_type enum (opus/mp4/pdf/doc/xls/ppt/stream)
+function feishuFileType(ext: string): string {
+  const e = ext.toLowerCase().replace(/^\./, '')
+  if (['opus', 'mp4'].includes(e)) return e
+  if (['pdf', 'doc', 'docx'].includes(e)) return e === 'docx' ? 'doc' : e
+  if (['xls', 'xlsx'].includes(e)) return 'xls'
+  if (['ppt', 'pptx'].includes(e)) return 'ppt'
+  return 'stream'  // generic fallback for any other extension
+}
 
 // ── env / state dir ─────────────────────────────────────────────────────
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'feishu')
@@ -154,7 +166,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Feishu. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quote-threading.',
+        'Reply on Feishu. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quote-threading, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -163,6 +175,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Absolute file paths to attach. Images (jpg/png/webp/gif/etc) send as image msg via im.v1.image.create (max 10MB); other types send as file msg via im.v1.file.create with auto-detected file_type (max 30MB). Each file is sent as a separate Feishu message.',
           },
         },
         required: ['chat_id', 'text'],
@@ -179,26 +196,85 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
+        const files = (args.files as string[] | undefined) ?? []
+        const sentIds: string[] = []
 
-        // Feishu text message body uses { text: "..." } JSON payload
-        const content = JSON.stringify({ text })
-
-        const resp = reply_to
-          ? await client.im.v1.message.reply({
-              path: { message_id: reply_to },
-              data: { content, msg_type: 'text' },
-            })
-          : await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: { receive_id: chat_id, msg_type: 'text', content },
-            })
-
-        if (resp.code !== 0) {
-          throw new Error(`feishu API error code=${resp.code} msg=${resp.msg}`)
+        // Send text message first (if non-empty)
+        if (text && text.length > 0) {
+          const content = JSON.stringify({ text })
+          const resp = reply_to
+            ? await client.im.v1.message.reply({
+                path: { message_id: reply_to },
+                data: { content, msg_type: 'text' },
+              })
+            : await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: chat_id, msg_type: 'text', content },
+              })
+          if (resp.code !== 0) {
+            throw new Error(`feishu text API error code=${resp.code} msg=${resp.msg}`)
+          }
+          const id = resp.data?.message_id ?? '<unknown>'
+          sentIds.push(id)
+          chatLog('BOT', text, { message_id: id })
         }
-        const id = resp.data?.message_id ?? '<unknown>'
-        chatLog('BOT', text, { message_id: id })
-        return { content: [{ type: 'text', text: `sent (id: ${id})` }] }
+
+        // Send each file as separate message (Feishu doesn't mix text+file in one msg)
+        for (const f of files) {
+          if (!existsSync(f)) {
+            throw new Error(`file not found: ${f}`)
+          }
+          const ext = extname(f).toLowerCase()
+          const fname = basename(f)
+          let key: string
+          let msg_type: string
+          let content: string
+          if (IMAGE_EXTS.has(ext)) {
+            // Image upload via im.v1.image.create
+            const upResp = await client.im.v1.image.create({
+              data: { image_type: 'message', image: createReadStream(f) },
+            })
+            if (upResp.code !== 0) {
+              throw new Error(`feishu image upload error code=${upResp.code} msg=${upResp.msg}`)
+            }
+            key = (upResp.data?.image_key as string) ?? ''
+            msg_type = 'image'
+            content = JSON.stringify({ image_key: key })
+          } else {
+            // Generic file upload via im.v1.file.create
+            const ftype = feishuFileType(ext)
+            const upResp = await client.im.v1.file.create({
+              data: { file_type: ftype as any, file_name: fname, file: createReadStream(f) },
+            })
+            if (upResp.code !== 0) {
+              throw new Error(`feishu file upload error code=${upResp.code} msg=${upResp.msg}`)
+            }
+            key = (upResp.data?.file_key as string) ?? ''
+            msg_type = 'file'
+            content = JSON.stringify({ file_key: key })
+          }
+
+          const sendResp = reply_to
+            ? await client.im.v1.message.reply({
+                path: { message_id: reply_to },
+                data: { content, msg_type },
+              })
+            : await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: chat_id, msg_type, content },
+              })
+          if (sendResp.code !== 0) {
+            throw new Error(`feishu ${msg_type} send error code=${sendResp.code} msg=${sendResp.msg}`)
+          }
+          const id = sendResp.data?.message_id ?? '<unknown>'
+          sentIds.push(id)
+          chatLog('BOT', `[${msg_type}] ${fname}`, { message_id: id, file_path: f, key })
+        }
+
+        const summary = sentIds.length === 1
+          ? `sent (id: ${sentIds[0]})`
+          : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        return { content: [{ type: 'text', text: summary }] }
       }
       default:
         return {
