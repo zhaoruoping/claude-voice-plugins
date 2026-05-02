@@ -1,17 +1,19 @@
 #!/usr/bin/env bun
 /**
- * Feishu (飞书) channel for Claude Code — M1 skeleton (v0.0.2 marker comment).
+ * Feishu (飞书) channel for Claude Code — M1 + M2.
  *
  * Mirrors telegram-voice/server.ts architecture. Uses Lark Node SDK WebSocket
  * long-connection (no public IP needed) for receiving messages, OpenAPI for
  * sending replies. State lives in ${FEISHU_STATE_DIR:-~/.claude/channels/feishu}/
  * with .env (app credentials) and access.json (allowlist).
  *
- * M1 scope (this file): env load + MCP server + reply tool + inbound message
- * forwarding. Voice / files / edits / reactions / slash commands / memory
- * enhance to follow in M2-M6.
+ * M1: text in/out, MCP reply tool. Verified end-to-end 2026-05-01 (chat.log).
+ * M2 (v0.0.3, 2026-05-02): audio messages auto-transcribed via qwen3-asr-flash
+ *   (DashScope). Audio download via im.v1.messageResource.get + writeFile,
+ *   transcribe.py call mirrors telegram-voice STT flow with 3-attempt retry.
  *
- * v0.0.2 (2026-05-02): test marker for plugin auto-update mechanism experiment.
+ * Voice synthesis (voice_reply tool), files / images, edit_message, react,
+ * slash commands, memory enhance: TBD in M3-M6.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -21,7 +23,8 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import * as Lark from '@larksuiteoapi/node-sdk'
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, unlinkSync } from 'fs'
+import { spawnSync } from 'child_process'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
@@ -58,6 +61,9 @@ try {
 
 const APP_ID = process.env.FEISHU_APP_ID
 const APP_SECRET = process.env.FEISHU_APP_SECRET
+const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY
+const VOICE_PYTHON = process.env.VOICE_PYTHON ?? '/sw/miniconda3/envs/ccbesiii/bin/python'
+const STT_PROVIDER = process.env.FEISHU_VOICE_STT_PROVIDER ?? (DASHSCOPE_API_KEY ? 'dashscope' : null)
 const DOMAIN_KIND = (process.env.FEISHU_DOMAIN ?? 'feishu.cn').toLowerCase()
 
 if (!APP_ID || !APP_SECRET) {
@@ -234,7 +240,7 @@ wsClient.start({
         return
       }
 
-      // Only handle text in M1
+      // M1: text. M2: audio (voice → STT via qwen3-asr-flash → forward as text).
       let text = ''
       if (msg_type === 'text') {
         try {
@@ -243,8 +249,82 @@ wsClient.start({
         } catch {
           text = `<unparseable text content>`
         }
+      } else if (msg_type === 'audio') {
+        // Parse file_key from audio content
+        let file_key = ''
+        let duration = 0
+        try {
+          const content = JSON.parse(msg.content as string)
+          file_key = content.file_key ?? ''
+          duration = content.duration ?? 0
+        } catch {
+          // unparseable — fall through to error path below
+        }
+
+        if (!file_key) {
+          text = `[Voice message received — could not parse file_key from content]`
+        } else if (!STT_PROVIDER) {
+          text =
+            '[Voice message received — STT is not configured]\n' +
+            'This Feishu bot has no speech-to-text backend enabled. ' +
+            'Tell the user: 1) reply in text instead, or 2) configure DASHSCOPE_API_KEY in ~/.claude/voice/.env to enable qwen3-asr-flash STT.'
+        } else {
+          // Download audio + transcribe
+          const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.opus`)
+          try {
+            const dlResp = await client.im.v1.messageResource.get({
+              path: { message_id, file_key },
+              params: { type: 'file' },
+            })
+            await dlResp.writeFile(tmpPath)
+
+            // Retry loop matching telegram-voice (qwen3-asr-flash transient failures)
+            const MAX_ATTEMPTS = 3
+            const BACKOFF_MS = [500, 1500]
+            let sttOut = ''
+            let sttErr = ''
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+              const sttStart = Date.now()
+              const result = spawnSync(
+                VOICE_PYTHON,
+                [join(homedir(), '.claude/voice/transcribe.py'), '--provider', STT_PROVIDER, tmpPath],
+                { timeout: 60000, encoding: 'utf-8' },
+              )
+              const sttMs = Date.now() - sttStart
+              process.stderr.write(
+                `feishu STT attempt ${attempt}/${MAX_ATTEMPTS}: ms=${sttMs} status=${result.status} ` +
+                `out_chars=${(result.stdout ?? '').length} err_chars=${(result.stderr ?? '').length}\n`,
+              )
+              if (result.status === 0 && result.stdout && result.stdout.trim().length > 0) {
+                sttOut = result.stdout.trim()
+                break
+              }
+              if (result.status === 0) {
+                // Empty stdout = audio unrecognizable; retry won't help
+                sttErr = '<empty transcription>'
+                break
+              }
+              sttErr = result.stderr || `exit=${result.status}`
+              if (attempt < MAX_ATTEMPTS) {
+                await new Promise(r => setTimeout(r, BACKOFF_MS[attempt - 1]))
+              }
+            }
+            try { unlinkSync(tmpPath) } catch {}
+
+            if (sttOut) {
+              text = sttOut
+              process.stderr.write(`feishu STT success: "${text.slice(0, 80)}..." (duration=${duration}ms)\n`)
+            } else {
+              text = `[Voice message received — STT failed: ${sttErr || 'unknown'}]`
+            }
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            text = `[Voice message received — download/transcribe error: ${errMsg}]`
+            try { unlinkSync(tmpPath) } catch {}
+          }
+        }
       } else {
-        text = `<received ${msg_type} message — not yet supported in M1>`
+        text = `<received ${msg_type} message — not yet supported (M3+ feature)>`
       }
 
       chatLog('USER', text, { sender_open_id, chat_id, message_id, chat_type, msg_type })
