@@ -22,7 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { homedir } from 'os'
-import { join, extname, sep } from 'path'
+import { join, extname, basename, sep } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -871,19 +871,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
+        // NOTE: We deliberately bypass grammy's bot.api.sendPhoto/sendDocument
+        // here — grammy uploads files as a Node Readable stream body, and
+        // Bun fetch + HTTPS_PROXY drops the socket on streaming bodies (see
+        // bots/memo/articles/2026-05-03_mcp_tg_file_root_cause.md). We use
+        // raw fetch + FormData + Blob (buffered in memory) — same workaround
+        // as voice_reply at line 960 below. Files are size-capped to 50MB
+        // by MAX_ATTACHMENT_BYTES, validated above.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
+          const isPhoto = PHOTO_EXTS.has(ext)
+          const endpoint = isPhoto ? 'sendPhoto' : 'sendDocument'
+          const fieldName = isPhoto ? 'photo' : 'document'
+          const mime = isPhoto
+            ? (ext === '.png' ? 'image/png'
+              : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+              : ext === '.gif' ? 'image/gif'
+              : ext === '.webp' ? 'image/webp'
+              : 'application/octet-stream')
+            : 'application/octet-stream'
+          const buf = readFileSync(f)
+          const formData = new FormData()
+          formData.append('chat_id', chat_id)
+          formData.append(fieldName, new Blob([buf], { type: mime }), basename(f))
+          if (reply_to != null && replyMode !== 'off') {
+            formData.append('reply_parameters', JSON.stringify({ message_id: reply_to }))
           }
+          const sendRes = await fetch(`https://api.telegram.org/bot${TOKEN}/${endpoint}`, {
+            method: 'POST',
+            body: formData,
+          })
+          const sendData = await sendRes.json() as any
+          if (!sendData.ok) {
+            throw new Error(`${endpoint} failed for ${basename(f)}: ${sendData.error_code ?? '?'} ${sendData.description ?? JSON.stringify(sendData)}`)
+          }
+          sentIds.push(sendData.result.message_id)
         }
 
         const result =
