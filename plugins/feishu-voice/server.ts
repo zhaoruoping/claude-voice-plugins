@@ -229,27 +229,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           let key: string
           let msg_type: string
           let content: string
+          // Read file as Buffer (more reliable than ReadStream for Lark SDK FormData)
+          const fileBuf = readFileSync(f)
+          process.stderr.write(`feishu file upload: ${fname} (${fileBuf.length}B, ext=${ext})\n`)
+
           if (IMAGE_EXTS.has(ext)) {
             // Image upload via im.v1.image.create
             const upResp = await client.im.v1.image.create({
-              data: { image_type: 'message', image: createReadStream(f) },
+              data: { image_type: 'message', image: fileBuf },
             })
             if (upResp.code !== 0) {
               throw new Error(`feishu image upload error code=${upResp.code} msg=${upResp.msg}`)
             }
             key = (upResp.data?.image_key as string) ?? ''
+            if (!key) {
+              throw new Error(`feishu image upload returned no image_key: ${JSON.stringify(upResp)}`)
+            }
             msg_type = 'image'
             content = JSON.stringify({ image_key: key })
           } else {
             // Generic file upload via im.v1.file.create
             const ftype = feishuFileType(ext)
+            process.stderr.write(`  file_type detected: ${ftype}\n`)
             const upResp = await client.im.v1.file.create({
-              data: { file_type: ftype as any, file_name: fname, file: createReadStream(f) },
+              data: { file_type: ftype as any, file_name: fname, file: fileBuf },
             })
             if (upResp.code !== 0) {
               throw new Error(`feishu file upload error code=${upResp.code} msg=${upResp.msg}`)
             }
             key = (upResp.data?.file_key as string) ?? ''
+            if (!key) {
+              throw new Error(`feishu file upload returned no file_key: ${JSON.stringify(upResp)}`)
+            }
             msg_type = 'file'
             content = JSON.stringify({ file_key: key })
           }
