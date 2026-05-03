@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Feishu (飞书) channel for Claude Code — M1 + M2.
+ * Feishu (飞书) channel for Claude Code — M1 + M2 + M3 + M4.
  *
  * Mirrors telegram-voice/server.ts architecture. Uses Lark Node SDK WebSocket
  * long-connection (no public IP needed) for receiving messages, OpenAPI for
@@ -11,9 +11,16 @@
  * M2 (v0.0.3, 2026-05-02): audio messages auto-transcribed via qwen3-asr-flash
  *   (DashScope). Audio download via im.v1.messageResource.get + writeFile,
  *   transcribe.py call mirrors telegram-voice STT flow with 3-attempt retry.
+ * M3 (v0.0.6, 2026-05-02): file/image send via direct fetch (uploadImageDirect /
+ *   uploadFileDirect bypassing Lark SDK multipart, which broke MCP stdio).
+ * M4 (v0.0.7, 2026-05-03): edit_message + react + voice_reply.
+ *   - edit_message: im.v1.message.update (text/post only per Feishu API).
+ *   - react: im.v1.messageReaction.create with Feishu emoji_type whitelist
+ *     (uppercase strings: SMILE, LAUGH, THUMBSUP, HEART, ROSE, etc).
+ *   - voice_reply: synthesize.py (MiniMax TTS) → OGG Opus → uploadFileDirect
+ *     (file_type=opus) → msg_type=audio. Reuses voice/.env credentials.
  *
- * Voice synthesis (voice_reply tool), files / images, edit_message, react,
- * slash commands, memory enhance: TBD in M3-M6.
+ * Slash commands, memory enhance: TBD in M5-M6.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -218,9 +225,9 @@ const mcp = new Server(
     instructions: [
       'The sender reads Feishu (飞书), not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Feishu arrive as <channel source="feishu" chat_id="..." message_id="..." sender_open_id="..." ts="...">. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Feishu arrive as <channel source="feishu" chat_id="..." message_id="..." sender_open_id="..." ts="...">. Voice messages are AUTO-TRANSCRIBED via qwen3-asr-flash — the text content IS the transcription; do NOT re-transcribe. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'M1 scope: text messages only. Voice, images, files, edits, reactions to follow in later versions.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments — images send as image msg, other types as file msg. Choose between reply (text) and voice_reply (voice+text caption) based on content: use voice_reply for short conversational responses (confirmations, brief answers, casual chat); use text reply for anything with code, file paths, tables, lists, technical details, long explanations, or structured content. If the user explicitly requests voice or text, follow their preference. Use react to add emoji reactions (Feishu uses uppercase emoji_type strings: SMILE/LAUGH/THUMBSUP/HEART/ROSE/...), and edit_message for interim progress updates. When a long task completes, send a new reply so the user gets a notification.',
     ].join('\n'),
   },
 )
@@ -246,6 +253,45 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Absolute file paths to attach. Images (jpg/png/webp/gif/etc) send as image msg via im.v1.image.create (max 10MB); other types send as file msg via im.v1.file.create with auto-detected file_type (max 30MB). Each file is sent as a separate Feishu message.',
           },
+        },
+        required: ['chat_id', 'text'],
+      },
+    },
+    {
+      name: 'edit_message',
+      description: 'Edit a message the bot previously sent. Useful for interim progress updates during long tasks. Feishu only supports editing text and rich-text (post) messages — cards/files/audio cannot be edited via this tool. Edits do not trigger a new push notification, so when a long task completes send a fresh reply to ping the user.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message_id: { type: 'string', description: 'The message_id of the bot-sent message to edit.' },
+          text: { type: 'string', description: 'New text content.' },
+        },
+        required: ['message_id', 'text'],
+      },
+    },
+    {
+      name: 'react',
+      description: 'Add an emoji reaction to a Feishu message. Feishu uses an uppercase emoji_type whitelist (SMILE, LAUGH, THUMBSUP, THUMBSDOWN, HEART, OK, CRY, ANGRY, KISS, SCREAM, ROSE, etc.) — non-whitelisted values will be rejected. Differs from Telegram (which uses unicode emoji like 👍). The bot can only remove its own reactions later.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message_id: { type: 'string', description: 'The message_id to react to.' },
+          emoji_type: { type: 'string', description: 'Feishu emoji_type whitelist string (uppercase). Common: SMILE, LAUGH, THUMBSUP, THUMBSDOWN, HEART, OK, CRY, ANGRY, ROSE.' },
+        },
+        required: ['message_id', 'emoji_type'],
+      },
+    },
+    {
+      name: 'voice_reply',
+      description: 'Reply with a synthesized voice message on Feishu. Uses MiniMax TTS to convert text to speech and sends as a Feishu audio message (OGG Opus). Use this for short, simple replies — especially when the user sent a voice message. Falls back to text reply with a hint if MINIMAX_API_KEY/MINIMAX_GROUP_ID is not configured.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          text: { type: 'string', description: 'Text to synthesize into speech (also sent as a follow-up text message so the conversation stays searchable).' },
+          voice: { type: 'string', description: 'MiniMax voice ID (default: female-shaonv). Options: male-qn-qingse, female-shaonv, female-yujie, presenter_male, presenter_female' },
+          speed: { type: 'string', description: 'Speech speed 0.5-2.0 (default: 1.3)' },
+          reply_to: { type: 'string', description: 'Message ID to thread under (optional)' },
         },
         required: ['chat_id', 'text'],
       },
@@ -331,6 +377,114 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ? `sent (id: ${sentIds[0]})`
           : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         return { content: [{ type: 'text', text: summary }] }
+      }
+      case 'edit_message': {
+        const message_id = args.message_id as string
+        const text = args.text as string
+        const content = JSON.stringify({ text })
+        const resp = await client.im.v1.message.update({
+          path: { message_id },
+          data: { msg_type: 'text', content },
+        })
+        if (resp.code !== 0) {
+          throw new Error(`feishu edit_message API error code=${resp.code} msg=${resp.msg}`)
+        }
+        chatLog('BOT', `[edit] ${text}`, { message_id })
+        return { content: [{ type: 'text', text: `edited (id: ${message_id})` }] }
+      }
+      case 'react': {
+        const message_id = args.message_id as string
+        const emoji_type = args.emoji_type as string
+        const resp = await client.im.v1.messageReaction.create({
+          path: { message_id },
+          data: { reaction_type: { emoji_type } },
+        })
+        if (resp.code !== 0) {
+          throw new Error(`feishu react API error code=${resp.code} msg=${resp.msg}`)
+        }
+        const reaction_id = resp.data?.reaction_id ?? '<unknown>'
+        chatLog('BOT', `[react] ${emoji_type}`, { message_id, reaction_id })
+        return { content: [{ type: 'text', text: `reacted (reaction_id: ${reaction_id})` }] }
+      }
+      case 'voice_reply': {
+        const chat_id = args.chat_id as string
+        const text = args.text as string
+        const voiceId = (args.voice as string | undefined) ?? 'female-shaonv'
+        const speed = (args.speed as string | undefined) ?? '1.3'
+        const reply_to = args.reply_to as string | undefined
+
+        // Auto-degrade: if no MiniMax credentials, send as text instead so the
+        // bot stays functional. Hint goes back to Claude (not the user) so it
+        // can prompt the operator to configure the keys.
+        if (!process.env.MINIMAX_API_KEY || !process.env.MINIMAX_GROUP_ID) {
+          const fallbackContent = JSON.stringify({ text })
+          const fallbackResp = reply_to
+            ? await client.im.v1.message.reply({
+                path: { message_id: reply_to },
+                data: { content: fallbackContent, msg_type: 'text' },
+              })
+            : await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: chat_id, msg_type: 'text', content: fallbackContent },
+              })
+          if (fallbackResp.code !== 0) {
+            throw new Error(`voice_reply text fallback failed code=${fallbackResp.code} msg=${fallbackResp.msg}`)
+          }
+          const id = fallbackResp.data?.message_id ?? '<unknown>'
+          chatLog('BOT', `[voice->text fallback] ${text}`, { message_id: id })
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `sent as text (id: ${id}) — voice_reply degraded because ` +
+                `MINIMAX_API_KEY and/or MINIMAX_GROUP_ID is not set in ~/.claude/voice/.env. ` +
+                `Configure both and restart the bot to enable voice synthesis.`,
+            }],
+          }
+        }
+
+        // Synthesize MP3 + convert to OGG Opus via voice/synthesize.py
+        const mp3Path = `/tmp/feishu_tts_${Date.now()}.mp3`
+        const ttsResult = spawnSync(
+          VOICE_PYTHON,
+          [join(homedir(), '.claude/voice/synthesize.py'), '--voice', voiceId, '--speed', speed, '--ogg', text, mp3Path],
+          { timeout: 60000, encoding: 'utf-8' },
+        )
+        if (ttsResult.status !== 0) {
+          throw new Error(`TTS synthesis failed: ${(ttsResult.stderr ?? '').slice(0, 200)}`)
+        }
+        const oggMatch = (ttsResult.stdout ?? '').match(/OGG Opus: (.+)/)
+        if (!oggMatch) throw new Error('TTS did not produce OGG output')
+        const oggPath = oggMatch[1].trim()
+
+        // Upload OGG via direct fetch (file_type=opus) — Feishu accepts opus
+        // for audio messages. Lark SDK multipart broke MCP stdio (see M3 lesson).
+        const oggBuf = readFileSync(oggPath)
+        const oggName = basename(oggPath)
+        let file_key: string
+        try {
+          file_key = await uploadFileDirect(oggBuf, oggName, 'opus')
+        } finally {
+          try { unlinkSync(oggPath) } catch {}
+          try { unlinkSync(mp3Path) } catch {}
+        }
+
+        const audioContent = JSON.stringify({ file_key })
+        const sendResp = reply_to
+          ? await client.im.v1.message.reply({
+              path: { message_id: reply_to },
+              data: { content: audioContent, msg_type: 'audio' },
+            })
+          : await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: chat_id, msg_type: 'audio', content: audioContent },
+            })
+        if (sendResp.code !== 0) {
+          throw new Error(`feishu audio send error code=${sendResp.code} msg=${sendResp.msg}`)
+        }
+        const id = sendResp.data?.message_id ?? '<unknown>'
+        chatLog('BOT', `[voice] ${text}`, { message_id: id, file_key })
+        return { content: [{ type: 'text', text: `sent (id: ${id})` }] }
       }
       default:
         return {
