@@ -133,6 +133,71 @@ const wsClient = new Lark.WSClient({
   loggerLevel: Lark.LoggerLevel.warn,
 })
 
+// ── direct REST helpers (bypass Lark SDK for file uploads) ──────────────
+// Reason: SDK's multipart serialization breaks MCP stdio transport on
+// large/binary uploads (v0.0.4 ReadStream + v0.0.5 Buffer both fail with
+// "socket closed"). Direct fetch + manual FormData has no SDK side-effects
+// on the MCP stdio channel, so we use it for image/file upload.
+
+const FEISHU_BASE = DOMAIN === Lark.Domain.Lark
+  ? 'https://open.larksuite.com'
+  : 'https://open.feishu.cn'
+
+let _tenantTokenCache: { token: string; expires_at: number } | null = null
+
+async function getTenantAccessToken(): Promise<string> {
+  if (_tenantTokenCache && Date.now() < _tenantTokenCache.expires_at) {
+    return _tenantTokenCache.token
+  }
+  const resp = await fetch(`${FEISHU_BASE}/open-apis/auth/v3/tenant_access_token/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
+  })
+  const data = (await resp.json()) as any
+  if (data.code !== 0) throw new Error(`tenant_access_token failed: ${JSON.stringify(data)}`)
+  _tenantTokenCache = {
+    token: data.tenant_access_token,
+    expires_at: Date.now() + (data.expire ?? 7200) * 1000 - 60_000,  // 60s safety margin
+  }
+  return _tenantTokenCache.token
+}
+
+async function uploadImageDirect(buf: Buffer, fname: string): Promise<string> {
+  const token = await getTenantAccessToken()
+  const form = new FormData()
+  form.append('image_type', 'message')
+  form.append('image', new Blob([buf]), fname)
+  const resp = await fetch(`${FEISHU_BASE}/open-apis/im/v1/images`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+  const data = (await resp.json()) as any
+  if (data.code !== 0) throw new Error(`image upload failed: ${JSON.stringify(data)}`)
+  const key = data.data?.image_key
+  if (!key) throw new Error(`image upload returned no image_key: ${JSON.stringify(data)}`)
+  return key
+}
+
+async function uploadFileDirect(buf: Buffer, fname: string, file_type: string): Promise<string> {
+  const token = await getTenantAccessToken()
+  const form = new FormData()
+  form.append('file_type', file_type)
+  form.append('file_name', fname)
+  form.append('file', new Blob([buf]), fname)
+  const resp = await fetch(`${FEISHU_BASE}/open-apis/im/v1/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+  const data = (await resp.json()) as any
+  if (data.code !== 0) throw new Error(`file upload failed: ${JSON.stringify(data)}`)
+  const key = data.data?.file_key
+  if (!key) throw new Error(`file upload returned no file_key: ${JSON.stringify(data)}`)
+  return key
+}
+
 // ── chat log helper ─────────────────────────────────────────────────────
 const LOG_FILE = join(STATE_DIR, 'chat.log')
 function chatLog(role: 'USER' | 'BOT', text: string, extra?: Record<string, unknown>): void {
@@ -229,38 +294,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           let key: string
           let msg_type: string
           let content: string
-          // Read file as Buffer (more reliable than ReadStream for Lark SDK FormData)
+          // Read file as Buffer
           const fileBuf = readFileSync(f)
-          process.stderr.write(`feishu file upload: ${fname} (${fileBuf.length}B, ext=${ext})\n`)
+          // v0.0.6: bypass Lark SDK for upload — use direct fetch (SDK
+          // multipart serialization broke MCP stdio in v0.0.4 + v0.0.5)
 
           if (IMAGE_EXTS.has(ext)) {
-            // Image upload via im.v1.image.create
-            const upResp = await client.im.v1.image.create({
-              data: { image_type: 'message', image: fileBuf },
-            })
-            if (upResp.code !== 0) {
-              throw new Error(`feishu image upload error code=${upResp.code} msg=${upResp.msg}`)
-            }
-            key = (upResp.data?.image_key as string) ?? ''
-            if (!key) {
-              throw new Error(`feishu image upload returned no image_key: ${JSON.stringify(upResp)}`)
-            }
+            key = await uploadImageDirect(fileBuf, fname)
             msg_type = 'image'
             content = JSON.stringify({ image_key: key })
           } else {
-            // Generic file upload via im.v1.file.create
             const ftype = feishuFileType(ext)
-            process.stderr.write(`  file_type detected: ${ftype}\n`)
-            const upResp = await client.im.v1.file.create({
-              data: { file_type: ftype as any, file_name: fname, file: fileBuf },
-            })
-            if (upResp.code !== 0) {
-              throw new Error(`feishu file upload error code=${upResp.code} msg=${upResp.msg}`)
-            }
-            key = (upResp.data?.file_key as string) ?? ''
-            if (!key) {
-              throw new Error(`feishu file upload returned no file_key: ${JSON.stringify(upResp)}`)
-            }
+            key = await uploadFileDirect(fileBuf, fname, ftype)
             msg_type = 'file'
             content = JSON.stringify({ file_key: key })
           }
