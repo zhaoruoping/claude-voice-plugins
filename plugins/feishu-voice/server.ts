@@ -21,6 +21,9 @@
  *     (file_type=opus) → msg_type=audio. Reuses voice/.env credentials.
  *
  * Slash commands, memory enhance: TBD in M5-M6.
+ *
+ * v0.0.8 (2026-05-03): no-op header touch — smoke test for the new
+ * /plugin-update skill. No behavior change.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
