@@ -1278,8 +1278,10 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  let text = ctx.message.caption ?? '(voice message)'
+  const defaultVoiceText = ctx.message.caption ?? '(voice message)'
+  let text = defaultVoiceText
   let sttFailed = false
+  let sttSucceeded = false
   const sttSeq = ++_logSeq
 
   dlog(sttSeq, 'voice_received', `file_id=${voice.file_id}, size=${voice.file_size}`)
@@ -1360,6 +1362,7 @@ bot.on('message:voice', async ctx => {
             const transcription = lines[lines.length - 1]
             if (transcription && transcription.trim().length > 0) {
               text = transcription
+              sttSucceeded = true
               dlog(sttSeq, 'stt_success', `chars=${transcription.length}, attempts=${attempt}`)
             } else {
               sttFailed = true
@@ -1383,9 +1386,21 @@ bot.on('message:voice', async ctx => {
     }
 
     // STT runtime failure fallback: still deliver to Claude so the bot responds
-    if (sttFailed && text === (ctx.message.caption ?? '(voice message)')) {
+    if (sttFailed && text === defaultVoiceText) {
       text = `[Voice transcription failed via ${sttProvider} after retries] A voice message was received but could not be transcribed. Ask the user to resend or switch to text.`
       dlog(sttSeq, 'stt_fallback', 'delivering failure notice to Claude')
+    }
+  }
+
+  if (sttSucceeded && text.trim().length > 0) {
+    try {
+      await ctx.api.sendMessage(ctx.chat.id, `🎤 "${text}"`, {
+        reply_parameters: { message_id: ctx.message.message_id },
+      })
+      dlog(sttSeq, 'stt_echo_sent', `chars=${text.length}`)
+    } catch (err) {
+      process.stderr.write(`telegram channel: stt echo-back failed: ${String(err)}\n`)
+      dlog(sttSeq, 'stt_echo_failed', String(err))
     }
   }
 
