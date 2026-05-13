@@ -93,6 +93,129 @@ const MEMORY_ENHANCE_CONFIG = join(_projectDir, 'bots', 'memory_enhance.json')
 // Files are hot-reloaded on every message for instant updates without restart.
 const GLOBAL_COMMANDS_FILE = join(_projectDir, 'bots', 'telegram_commands_global.json')
 const BOT_REGISTRY_FILE = join(_projectDir, 'bots', 'bot_registry.json')
+const CLAUDE_BUILTIN_SLASHES = ['/goal', '/model', '/effort']
+const NATIVE_SLASH_DEBUG_LOG = join(STATE_DIR, 'plugin_debug.log')
+
+type BotRegistryEntry = {
+  state_dir?: string
+  current_task?: string | { name?: string }
+  tmux_session?: string
+}
+
+function nativeSlashDebug(seq: number, detail: string): void {
+  const ts = new Date().toISOString()
+  const line = `[native-slash] #${seq} ${ts} ${detail}\n`
+  process.stderr.write(line)
+  try { appendFileSync(NATIVE_SLASH_DEBUG_LOG, line) } catch {}
+}
+
+function currentBotFromRegistry(): { name: string; bot: BotRegistryEntry } | undefined {
+  try {
+    const reg = JSON.parse(readFileSync(BOT_REGISTRY_FILE, 'utf8')) as { bots?: Record<string, BotRegistryEntry> }
+    const stateDir = (process.env.TELEGRAM_STATE_DIR ?? '').replace(/\/+$/, '')
+    for (const [name, bot] of Object.entries(reg.bots ?? {})) {
+      const botDir = (bot.state_dir ?? '').replace(/^\.\//, '').replace(/\/+$/, '')
+      const absBotDir = join(_projectDir, botDir).replace(/\/+$/, '')
+      if (stateDir === absBotDir || stateDir.endsWith(botDir)) return { name, bot }
+    }
+  } catch {}
+  return undefined
+}
+
+function taskLabel(taskName: string): string {
+  return taskName
+    .split('_')
+    .map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w)
+    .join('-')
+}
+
+function currentTaskName(bot: BotRegistryEntry): string | undefined {
+  if (typeof bot.current_task === 'string') return bot.current_task
+  return bot.current_task?.name
+}
+
+function tmuxSessionExists(session: string): boolean {
+  return spawnSync('tmux', ['has-session', '-t', session], { encoding: 'utf8' }).status === 0
+}
+
+function resolveNativeSlashTmuxSession(seq: number): { session: string; botName: string; layer: string } | undefined {
+  const current = currentBotFromRegistry()
+  if (!current) {
+    nativeSlashDebug(seq, 'resolve failed: no bot_registry entry matched TELEGRAM_STATE_DIR')
+    return undefined
+  }
+
+  const { name, bot } = current
+  if (bot.tmux_session) {
+    if (tmuxSessionExists(bot.tmux_session)) {
+      nativeSlashDebug(seq, `resolve layer1 bot.tmux_session=${bot.tmux_session}`)
+      return { session: bot.tmux_session, botName: name, layer: 'bot.tmux_session' }
+    }
+    nativeSlashDebug(seq, `resolve layer1 stale: ${bot.tmux_session}`)
+  }
+
+  const taskName = currentTaskName(bot)
+  if (taskName) {
+    const formulaSession = `tg_${name}_${taskLabel(taskName)}`
+    if (tmuxSessionExists(formulaSession)) {
+      nativeSlashDebug(seq, `resolve layer2 formula=${formulaSession}`)
+      return { session: formulaSession, botName: name, layer: 'formula' }
+    }
+    nativeSlashDebug(seq, `resolve layer2 miss: ${formulaSession}`)
+  }
+
+  const listed = spawnSync('tmux', ['list-sessions', '-F', '#S'], { encoding: 'utf8' })
+  if (listed.status === 0) {
+    const prefix = `tg_${name}_`
+    const match = listed.stdout.split(/\r?\n/).find(s => s.startsWith(prefix))
+    if (match) {
+      nativeSlashDebug(seq, `resolve layer3 tmux-list=${match}`)
+      return { session: match, botName: name, layer: 'tmux-list' }
+    }
+  } else {
+    nativeSlashDebug(seq, `resolve layer3 tmux list failed: ${listed.stderr?.trim()}`)
+  }
+
+  nativeSlashDebug(seq, `resolve failed for bot=${name}`)
+  return undefined
+}
+
+async function relayClaudeBuiltinSlash(text: string, chatId: string, seq: number): Promise<boolean> {
+  if (!text.startsWith('/')) return false
+  const firstWord = text.trim().split(/\s+/, 1)[0]
+  if (!CLAUDE_BUILTIN_SLASHES.includes(firstWord)) return false
+
+  const resolved = resolveNativeSlashTmuxSession(seq)
+  if (!resolved) {
+    await bot.api.sendMessage(chatId, '无法定位 bot tmux,请联系 admin').catch(() => {})
+    nativeSlashDebug(seq, `relay rejected for ${firstWord}: no tmux session`)
+    return true
+  }
+
+  const pane = spawnSync('tmux', ['capture-pane', '-t', resolved.session, '-p'], { encoding: 'utf8' })
+  const tail = pane.status === 0 ? pane.stdout.trimEnd().split(/\r?\n/).slice(-3) : []
+  const emptyPromptVisible = tail.some(line => /❯\s*$/.test(line))
+  const busy = !emptyPromptVisible || tail.some(line => /Thinking|Tool:/i.test(line))
+  nativeSlashDebug(
+    seq,
+    `prompt_check session=${resolved.session} layer=${resolved.layer} empty_prompt=${emptyPromptVisible} busy=${busy}; force send-keys per option(c)`,
+  )
+
+  const sendText = spawnSync('tmux', ['send-keys', '-t', resolved.session, '-l', text], { encoding: 'utf8' })
+  const sendEnter = sendText.status === 0
+    ? spawnSync('tmux', ['send-keys', '-t', resolved.session, 'Enter'], { encoding: 'utf8' })
+    : sendText
+  if (sendText.status !== 0 || sendEnter.status !== 0) {
+    const err = (sendText.stderr || sendEnter.stderr || 'tmux send-keys failed').trim()
+    await bot.api.sendMessage(chatId, '无法定位 bot tmux,请联系 admin').catch(() => {})
+    nativeSlashDebug(seq, `relay failed session=${resolved.session}: ${err}`)
+    return true
+  }
+
+  await bot.api.sendMessage(chatId, `▶ Relayed \`${text}\` to ${resolved.botName}`).catch(() => {})
+  nativeSlashDebug(seq, `relay success ${firstWord} -> ${resolved.session}`)
+  return true
+}
 
 function loadSlashCommands(): Record<string, string> {
   const commands: Record<string, string> = {}
@@ -1556,11 +1679,17 @@ async function handleInbound(
     dlog(seq, 'reply_reminder_toggle', `${status} (saved to ${REPLY_REMINDER_CONFIG})`)
     return // don't forward toggle commands to Claude
   }
-  // Re-read global config each message (another bot may have toggled it)
-  replyReminderEnabled = loadReplyReminderEnabled()
+	  // Re-read global config each message (another bot may have toggled it)
+	  replyReminderEnabled = loadReplyReminderEnabled()
 
-  // ── Slash command routing (global + task-specific) ──
-  const slashRoute = routeSlashCommand(text)
+	  // ── Claude Code native slash relay (/goal, /model, /effort) ──
+	  // Native REPL slashes must enter via tmux send-keys, not mcp.notification.
+	  if (await relayClaudeBuiltinSlash(text, chat_id, seq)) {
+	    return
+	  }
+
+	  // ── Slash command routing (global + task-specific) ──
+	  const slashRoute = routeSlashCommand(text)
   if (slashRoute.matched) {
     text = slashRoute.prompt!
     dlog(seq, 'slash_cmd_routed', `${slashRoute.command} -> ${text.slice(0, 80)}...`)
