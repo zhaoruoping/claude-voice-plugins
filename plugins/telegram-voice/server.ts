@@ -860,7 +860,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading. To attach files (PDF, image, etc.), pass them as the `files` PARAMETER (array of absolute paths) — DO NOT write "[Attachments: /path]" or similar path-like text in the `text` body; the plugin does NOT parse text for file references and such strings will be sent as literal text with NO file attached. Return is "sent N parts (ids: ...)" when files attach successfully (text + each file = 1 part, so N≥2 with files); "sent (id: N)" with a single id means text-only (no file attached, retry with `files` parameter if a file was intended).',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading.\n\n' +
+        'FORMATTING POLICY — when the reply contains ANY of the following, STRONGLY PREFER format="markdownv2" instead of plain text:\n' +
+        '  • Tables / cutflow / multi-column comparison data (use ```code blocks``` for monospace alignment — chars inside code blocks DO NOT need MarkdownV2 escaping, so numeric tables render cleanly)\n' +
+        '  • Key results / final numbers that should stand out (wrap in *bold*)\n' +
+        '  • Section headings on a longer report (use *bold* with emoji prefix like 📊 📈 🎯 ⚠️)\n' +
+        '  • Lists with sub-items, version comparisons, or step-by-step breakdowns\n' +
+        '  • File paths, inline code, command snippets (wrap in `inline backticks`)\n' +
+        'Plain text (default) is fine for short conversational replies, single-line acknowledgements, and casual chat where structure adds noise.\n\n' +
+        'MarkdownV2 syntax: *bold* / _italic_ / __underline__ / ~strikethrough~ / `inline code` / ```code block``` / [link](https://example.com) / >quoted line / ||spoiler||\n' +
+        'MarkdownV2 special chars OUTSIDE code blocks MUST be backslash-escaped: _ * [ ] ( ) ~ ` > # + - = | { } . !\n' +
+        'INSIDE ```code blocks``` and `inline code` no escaping is needed — that is why tables of numbers belong in code blocks.\n\n' +
+        'To attach files (PDF, image, etc.), pass them as the `files` PARAMETER (array of absolute paths) — DO NOT write "[Attachments: /path]" or similar path-like text in the `text` body; the plugin does NOT parse text for file references and such strings will be sent as literal text with NO file attached. Return is "sent N parts (ids: ...)" when files attach successfully (text + each file = 1 part, so N≥2 with files); "sent (id: N)" with a single id means text-only (no file attached, retry with `files` parameter if a file was intended).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -878,7 +889,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: 'string',
             enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            description:
+              "Rendering mode. PREFER 'markdownv2' when the message has structured content (tables, multi-column comparisons, version diffs, lists with hierarchy, key results to emphasize). Use 'text' for short conversational/acknowledgement replies.\n" +
+              "MarkdownV2 syntax: *bold* / _italic_ / __underline__ / ~strikethrough~ / `inline code` / ```code block (monospace, table-friendly)``` / [link](url) / >quote / ||spoiler||.\n" +
+              "Critical escape rule: chars _ * [ ] ( ) ~ ` > # + - = | { } . ! must be backslash-escaped OUTSIDE code blocks. INSIDE code blocks no escaping needed — that is why numeric tables go in ```code blocks```. Default: 'text' (plain, no escaping required).",
           },
         },
         required: ['chat_id', 'text'],
@@ -935,7 +949,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: 'string',
             enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            description:
+              "Rendering mode. PREFER 'markdownv2' when the message has structured content (tables, multi-column comparisons, version diffs, lists with hierarchy, key results to emphasize). Use 'text' for short conversational/acknowledgement replies.\n" +
+              "MarkdownV2 syntax: *bold* / _italic_ / __underline__ / ~strikethrough~ / `inline code` / ```code block (monospace, table-friendly)``` / [link](url) / >quote / ||spoiler||.\n" +
+              "Critical escape rule: chars _ * [ ] ( ) ~ ` > # + - = | { } . ! must be backslash-escaped OUTSIDE code blocks. INSIDE code blocks no escaping needed — that is why numeric tables go in ```code blocks```. Default: 'text' (plain, no escaping required).",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
