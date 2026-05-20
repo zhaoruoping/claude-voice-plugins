@@ -44,9 +44,18 @@ if (!MY_SESSION_ID) {
 }
 
 const MY_SOCKET = path.join(SOCKET_DIR, `${MY_SESSION_ID}.sock`)
-const CHANNEL_LOG = process.env.SLICE_CHANNEL_LOG_DIR
-  ? path.join(process.env.SLICE_CHANNEL_LOG_DIR, `${MY_SESSION_ID}.channel_log.jsonl`)
-  : null
+// CHANNEL_LOG resolution order:
+//   1. SLICE_CHANNEL_LOG_FILE (full path) — preferred. slice_manager.py sets
+//      this to <task>/slices/instances/<uuid>/channel_log.jsonl so the audit
+//      trail lives with the slice's metadata.
+//   2. SLICE_CHANNEL_LOG_DIR (shared dir) — legacy fallback; appends
+//      <session_id>.channel_log.jsonl within that dir.
+//   3. null — no audit log.
+const CHANNEL_LOG = process.env.SLICE_CHANNEL_LOG_FILE
+  ? process.env.SLICE_CHANNEL_LOG_FILE
+  : process.env.SLICE_CHANNEL_LOG_DIR
+    ? path.join(process.env.SLICE_CHANNEL_LOG_DIR, `${MY_SESSION_ID}.channel_log.jsonl`)
+    : null
 
 try {
   fs.mkdirSync(SOCKET_DIR, { recursive: true, mode: 0o755 })
