@@ -1,0 +1,7 @@
+{
+  "name": "slice-channel",
+  "description": "Local push-based IPC between a main Claude Code session and its forked slices",
+  "version": "0.1.0",
+  "keywords": ["slice", "fork", "channel", "ipc", "mcp"],
+  "license": "Apache-2.0"
+}

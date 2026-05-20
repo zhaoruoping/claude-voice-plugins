@@ -18,6 +18,12 @@
       "description": "Feishu (\u98de\u4e66) channel for Claude Code mirroring telegram-voice; M1 text echo, voice/files to follow",
       "source": "./plugins/feishu-voice",
       "category": "messaging"
+    },
+    {
+      "name": "slice-channel",
+      "description": "Local push-based IPC between a main Claude session and its forked slices (self-fork mechanism). Per general/self_fork_skill_dev/design.md \u00a77.",
+      "source": "./plugins/slice-channel",
+      "category": "messaging"
     }
   ]
 }
