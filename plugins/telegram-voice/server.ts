@@ -217,6 +217,100 @@ async function relayClaudeBuiltinSlash(text: string, chatId: string, seq: number
   return true
 }
 
+// /tmux <text...>  — generic tmux send-keys escape hatch (v0.5.8, 2026-05-17 user msg 4798+4800).
+// Lets the user inject ANY text or special key into the bot's own tmux pane via TG DM.
+// Smart key detection: first arg in TMUX_SPECIAL_KEYS → sent as special key (no Enter after).
+// Otherwise: literal text + Enter (claude REPL receives as if typed by user).
+// Multi-key special sequences supported: "/tmux Esc Esc" → two Escapes.
+// Only acts on the recipient bot's OWN tmux session (no cross-bot — use alice_cli.py dm for that).
+const TMUX_SPECIAL_KEYS = new Set([
+  'Escape', 'Esc', 'Enter', 'Tab', 'Space', 'BSpace', 'Backspace',
+  'Up', 'Down', 'Left', 'Right',
+  'PageUp', 'PageDown', 'Home', 'End', 'Delete',
+  'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
+])
+
+function isTmuxSpecialKey(token: string): boolean {
+  if (TMUX_SPECIAL_KEYS.has(token)) return true
+  // Ctrl combos: C-a..C-z, C-Space, C-/  etc.
+  if (/^C-[a-zA-Z]$/.test(token)) return true
+  if (token === 'C-Space' || token === 'C-/') return true
+  // Alt/Meta combos: M-a..M-z, M-Backspace
+  if (/^M-[a-zA-Z]$/.test(token)) return true
+  if (token === 'M-Backspace' || token === 'M-Delete') return true
+  return false
+}
+
+// Bug fix 2026-05-20 (user msg 882): tmux `send-keys` only recognizes the FULL
+// canonical name `Escape` — passing `Esc` causes tmux to type the literal 3
+// characters "E", "s", "c" (verified via xxd: 0x45 0x73 0x63 instead of 0x1B).
+// Translate the user-facing alias to the tmux-canonical name BEFORE invoking
+// subprocess. Mirrors tools/bots_dashboard_web.py:_canonical_tmux_key (dashboard
+// commit 1b478f3) — same root cause, parallel fix here for /tmux command.
+const TMUX_KEY_CANONICAL: Record<string, string> = {
+  'Esc': 'Escape',
+}
+function canonicalTmuxKey(token: string): string {
+  return TMUX_KEY_CANONICAL[token] ?? token
+}
+
+async function relayTmuxInject(text: string, chatId: string, seq: number): Promise<boolean> {
+  if (!text.startsWith('/tmux ') && text.trim() !== '/tmux') return false
+  const rest = text.slice(6).trim()  // drop '/tmux '
+  if (!rest) {
+    await bot.api.sendMessage(chatId, 'Usage: /tmux <text> | /tmux <Key1> [<Key2>...]\nSpecial keys: Esc Enter Tab C-c C-d Up Down ...').catch(() => {})
+    return true
+  }
+
+  const resolved = resolveNativeSlashTmuxSession(seq)
+  if (!resolved) {
+    await bot.api.sendMessage(chatId, '无法定位 bot tmux,请联系 admin').catch(() => {})
+    nativeSlashDebug(seq, `tmux-inject rejected: no tmux session`)
+    return true
+  }
+
+  // Parse: if EVERY whitespace-split token is a special key → send all as special keys (no Enter).
+  // Otherwise → treat whole `rest` as literal text + Enter.
+  const tokens = rest.split(/\s+/)
+  const allSpecial = tokens.length > 0 && tokens.every(isTmuxSpecialKey)
+
+  let success = true
+  let errMsg = ''
+  if (allSpecial) {
+    // Send each special key as a separate send-keys call (no -l, no Enter after).
+    // Translate user-facing aliases (e.g. "Esc") to tmux-canonical names
+    // ("Escape") via canonicalTmuxKey before subprocess invocation — tmux's
+    // send-keys does NOT recognize the short form and silently types it as
+    // literal characters (user msg 882, 2026-05-20).
+    for (const key of tokens) {
+      const canonical = canonicalTmuxKey(key)
+      const r = spawnSync('tmux', ['send-keys', '-t', resolved.session, canonical], { encoding: 'utf8' })
+      if (r.status !== 0) { success = false; errMsg = (r.stderr || `send-keys ${canonical} failed`).trim(); break }
+    }
+    nativeSlashDebug(seq, `tmux-inject special-keys [${tokens.join(', ')}] -> ${resolved.session}`)
+  } else {
+    // Literal text + Enter
+    const sendText = spawnSync('tmux', ['send-keys', '-t', resolved.session, '-l', rest], { encoding: 'utf8' })
+    const sendEnter = sendText.status === 0
+      ? spawnSync('tmux', ['send-keys', '-t', resolved.session, 'Enter'], { encoding: 'utf8' })
+      : sendText
+    if (sendText.status !== 0 || sendEnter.status !== 0) {
+      success = false
+      errMsg = (sendText.stderr || sendEnter.stderr || 'tmux send-keys failed').trim()
+    }
+    nativeSlashDebug(seq, `tmux-inject literal "${rest.slice(0, 60)}" + Enter -> ${resolved.session}`)
+  }
+
+  if (!success) {
+    await bot.api.sendMessage(chatId, `❌ tmux inject failed: ${errMsg}`).catch(() => {})
+    return true
+  }
+
+  const display = allSpecial ? `[${tokens.join(' ')}]` : `\`${rest.slice(0, 100)}${rest.length > 100 ? '...' : ''}\``
+  await bot.api.sendMessage(chatId, `▶ Injected ${display} to ${resolved.botName} tmux`).catch(() => {})
+  return true
+}
+
 function loadSlashCommands(): Record<string, string> {
   const commands: Record<string, string> = {}
   // Layer 1: global commands
@@ -1702,6 +1796,13 @@ async function handleInbound(
 	  // ── Claude Code native slash relay (/goal, /model, /effort) ──
 	  // Native REPL slashes must enter via tmux send-keys, not mcp.notification.
 	  if (await relayClaudeBuiltinSlash(text, chat_id, seq)) {
+	    return
+	  }
+
+	  // ── Generic tmux inject escape hatch (v0.5.8) ──
+	  // /tmux <text>     → literal text + Enter (claude REPL gets it as a user prompt)
+	  // /tmux <Key>...   → special key(s), no Enter (e.g. /tmux Esc Esc, /tmux C-c)
+	  if (await relayTmuxInject(text, chat_id, seq)) {
 	    return
 	  }
 
