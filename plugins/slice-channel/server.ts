@@ -93,7 +93,7 @@ function logChannel(direction: 'in' | 'out', payload: any): void {
 const INSTRUCTIONS = [
   'slice-channel is a local push-based IPC between a main claude session and its forked slices.',
   'Messages from another slice/main arrive as <channel source="slice-channel" from_session_id="..." from_label="..." ts="...">.',
-  'To send a message, call the slice_send tool with the target session_id (you receive it at fork time in the SLICE IDENTITY block, or from slice_manager.py output).',
+  'To send a message, call the slice_send tool with arguments: target_session_id (UUID, receiver session) + content (message body — note: parameter name is `content`, NOT `text`; this differs from telegram-voice / weixin reply tools). You receive target_session_id at fork time in the SLICE IDENTITY block, or from slice_manager.py output.',
   'If you are a slice: only call slice_send to reach back to your main. Do NOT call slice_send to arbitrary session_ids — that breaks lineage and audit.',
   'If you are main: you may call slice_send to any of your active slice instances.',
 ].join('\n')
