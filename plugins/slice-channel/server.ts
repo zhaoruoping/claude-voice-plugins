@@ -317,6 +317,14 @@ function cleanup(): void {
 
 process.on('SIGINT', () => { cleanup(); process.exit(0) })
 process.on('SIGTERM', () => { cleanup(); process.exit(0) })
+// Parent claude closing the MCP stdio pipe yields stdin EOF. Without these the
+// net.createServer above keeps the event loop alive forever → orphaned server
+// (matches telegram-voice/server.ts stdin end/close → shutdown). The orphan
+// then buffers inbound notifications unboundedly against a dead stdout pipe
+// ('drain' never fires) — root cause of the 48GB RSS leak. See
+// general/self_fork_skill_dev/slice_results/bun_leak_investigation.md.
+process.stdin.on('end', () => { cleanup(); process.exit(0) })
+process.stdin.on('close', () => { cleanup(); process.exit(0) })
 process.on('exit', cleanup)
 
 process.on('unhandledRejection', (err) => {
