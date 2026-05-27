@@ -1,0 +1,7 @@
+{
+  "name": "html-channel",
+  "description": "Bridge between an HTML page's embedded chat box and a Claude Code slice — chat-edit a web page live (sibling of slice-channel)",
+  "version": "0.2.0",
+  "keywords": ["html", "channel", "chat", "live-reload", "sse", "mcp", "slice"],
+  "license": "Apache-2.0"
+}

@@ -24,6 +24,12 @@
       "description": "Local push-based IPC between a main Claude session and its forked slices (self-fork mechanism). Per general/self_fork_skill_dev/design.md \u00a77.",
       "source": "./plugins/slice-channel",
       "category": "messaging"
+    },
+    {
+      "name": "html-channel",
+      "description": "Bridge between an HTML page's embedded chat box and a Claude Code slice \u2014 chat-edit a web page live (sibling of slice-channel). Per general/html_channel_dev/DESIGN.md.",
+      "source": "./plugins/html-channel",
+      "category": "messaging"
     }
   ]
 }

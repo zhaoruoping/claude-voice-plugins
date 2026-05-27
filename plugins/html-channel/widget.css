@@ -1,0 +1,57 @@
+/* html-channel chat widget — DOCKED side panel that REFLOWS page content
+   (never a floating overlay). Read per-request by the server → hot-reloadable:
+   edit this file + refresh the page; no slice restart needed.
+   Does NOT touch the report's own left TOC sidebar — the chat is a SEPARATE
+   right (or left) column; reflow is achieved by margin on <html>. */
+
+:root { --hc-w: 330px; }
+
+/* Reflow: shrink the document box so nothing hides behind the chat.
+   !important beats a report's own `html{margin:0}`. Fixed elements (the report's
+   left TOC) are unaffected; normal-flow content (center column) reflows. */
+html.hc-open-right { margin-right: var(--hc-w) !important; }
+html.hc-open-left  { margin-left:  var(--hc-w) !important; }
+html.hc-open-right, html.hc-open-left { transition: margin .18s ease; }
+
+#hc-panel {
+  position: fixed; top: 0; bottom: 0; width: var(--hc-w);
+  background: #fff; z-index: 2147483646;
+  display: flex; flex-direction: column;
+  box-shadow: 0 0 18px rgba(0,0,0,.16);
+  font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+  transition: transform .18s ease;
+}
+#hc-panel.hc-dock-right { right: 0; border-left: 1px solid #c8c8c8; }
+#hc-panel.hc-dock-left  { left: 0;  border-right: 1px solid #c8c8c8; }
+/* collapsed → slide the panel fully off its docked edge (tab stays) */
+#hc-panel.hc-collapsed.hc-dock-right { transform: translateX(100%); }
+#hc-panel.hc-collapsed.hc-dock-left  { transform: translateX(-100%); }
+
+/* the always-available toggle tab (shown only when collapsed) */
+#hc-tab {
+  position: fixed; top: 96px; z-index: 2147483647;
+  background: #2b5fb3; color: #fff; border: 0; cursor: pointer;
+  padding: 12px 6px; writing-mode: vertical-rl;
+  font: 600 12px/1 sans-serif; letter-spacing: .5px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+}
+#hc-tab.hc-dock-right { right: 0; border-radius: 6px 0 0 6px; }
+#hc-tab.hc-dock-left  { left: 0;  border-radius: 0 6px 6px 0; }
+
+#hc-head {
+  padding: 8px 12px; background: #2b5fb3; color: #fff; font-weight: 600;
+  display: flex; justify-content: space-between; align-items: center; gap: 6px;
+}
+#hc-head .hc-btns { display: flex; gap: 10px; }
+#hc-head button { background: transparent; border: 0; color: #fff; cursor: pointer; font-size: 15px; line-height: 1; opacity: .9; }
+#hc-head button:hover { opacity: 1; }
+#hc-head .dot { width: 8px; height: 8px; border-radius: 50%; background: #7CFC00; display: inline-block; margin-left: 4px; }
+
+#hc-log { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.hc-msg { padding: 6px 10px; border-radius: 10px; max-width: 88%; white-space: pre-wrap; word-break: break-word; }
+.hc-user  { align-self: flex-end;   background: #dcf0ff; }
+.hc-slice { align-self: flex-start; background: #eef0f2; }
+
+#hc-form { display: flex; border-top: 1px solid #e0e0e0; }
+#hc-input { flex: 1; border: 0; padding: 10px; font: inherit; outline: none; }
+#hc-send { border: 0; background: #2b5fb3; color: #fff; padding: 0 14px; cursor: pointer; }

@@ -1,0 +1,16 @@
+<!-- html-channel chat widget DOM (injected before </body>; read per-request → hot-reloadable). -->
+<button id="hc-tab" class="hc-dock-right" title="open editor chat">CHAT ◂</button>
+<div id="hc-panel" class="hc-dock-right">
+  <div id="hc-head">
+    <span>editor chat<span class="dot" id="hc-dot"></span></span>
+    <span class="hc-btns">
+      <button id="hc-dockbtn" title="dock left / right">⇆</button>
+      <button id="hc-collapse" title="hide (reading mode)">—</button>
+    </span>
+  </div>
+  <div id="hc-log"></div>
+  <form id="hc-form">
+    <input id="hc-input" placeholder="message the editor…" autocomplete="off"/>
+    <button id="hc-send" type="submit">Send</button>
+  </form>
+</div>
