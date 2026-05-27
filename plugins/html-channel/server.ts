@@ -163,9 +163,13 @@ function mimeOf(p: string): string {
   const ext = path.extname(p).toLowerCase()
   return ({
     '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
-    '.css': 'text/css', '.js': 'application/javascript', '.json': 'application/json',
+    '.css': 'text/css', '.js': 'application/javascript', '.mjs': 'application/javascript',
+    '.json': 'application/json', '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-    '.svg': 'image/svg+xml', '.webp': 'image/webp', '.pdf': 'application/pdf',
+    '.svg': 'image/svg+xml', '.webp': 'image/webp', '.ico': 'image/x-icon', '.pdf': 'application/pdf',
+    // fonts — needed for katex/vendor (woff2 etc.)
+    '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
+    '.otf': 'font/otf', '.eot': 'application/vnd.ms-fontobject',
   } as Record<string, string>)[ext] || 'application/octet-stream'
 }
 
@@ -353,11 +357,20 @@ const httpServer = Bun.serve({
           return new Response(`html-channel: cannot read page file ${PAGE_FILE}: ${err}`, { status: 500 })
         }
       }
-      // Static fallback for relative deck assets (images/css/js next to the deck)
+      // Static-sibling serving (R4): serve any file UNDER the deck's directory
+      // (e.g. /figures/x.png, /vendor/katex/katex.min.css, fonts) so reports can
+      // reference EXTERNAL assets instead of base64-inlining them.
+      // Path-safety: decode %xx (defeats %2e%2e traversal), resolve against the
+      // deck dir, and serve ONLY if the resolved real path stays UNDER deckDir.
       const deckDir = path.dirname(path.resolve(PAGE_FILE))
-      const reqPath = path.resolve(deckDir, '.' + p)
-      if (reqPath.startsWith(deckDir + path.sep) && fs.existsSync(reqPath) && fs.statSync(reqPath).isFile()) {
-        return new Response(fs.readFileSync(reqPath), { headers: { 'Content-Type': mimeOf(reqPath) } })
+      let decoded = p
+      try { decoded = decodeURIComponent(p) } catch { decoded = p }
+      const reqPath = path.resolve(deckDir, '.' + decoded)
+      const inDir = reqPath === deckDir || reqPath.startsWith(deckDir + path.sep)
+      if (inDir && fs.existsSync(reqPath) && fs.statSync(reqPath).isFile()) {
+        return new Response(fs.readFileSync(reqPath), {
+          headers: { 'Content-Type': mimeOf(reqPath), 'Cache-Control': 'no-cache' },
+        })
       }
     }
 
