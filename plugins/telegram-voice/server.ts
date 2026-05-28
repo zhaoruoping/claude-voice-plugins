@@ -1545,12 +1545,25 @@ bot.on('message:voice', async ctx => {
   } else {
     try {
       dlog(sttSeq, 'stt_start', `provider=${sttProvider}`)
-      const file = await bot.api.getFile(voice.file_id)
-      if (file.file_path) {
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        if (res.ok) {
-          const buf = Buffer.from(await res.arrayBuffer())
+      // Download voice file with retry — getFile + fetch are network-fragile;
+      // transient proxy/SSH-tunnel blips were the dominant STT-failure cause (2026-05-28 fix A)
+      let voiceBuf: Buffer | null = null
+      let sawFilePath = true
+      for (let dlAttempt = 1; dlAttempt <= 3; dlAttempt++) {
+        try {
+          const gf = await bot.api.getFile(voice.file_id)
+          if (!gf.file_path) { sawFilePath = false; break }
+          const url = `https://api.telegram.org/file/bot${TOKEN}/${gf.file_path}`
+          const res = await fetch(url)
+          if (res.ok) { voiceBuf = Buffer.from(await res.arrayBuffer()); break }
+          dlog(sttSeq, 'stt_download_retry', `attempt=${dlAttempt} http=${res.status}`)
+        } catch (e2) {
+          dlog(sttSeq, 'stt_download_retry', `attempt=${dlAttempt} threw: ${String(e2)}`)
+        }
+        if (dlAttempt < 3) await new Promise(r => setTimeout(r, [500, 1500][dlAttempt - 1]))
+      }
+      if (voiceBuf) {
+          const buf = voiceBuf
           const tmpPath = join(INBOX_DIR, `voice_stt_${Date.now()}.oga`)
           mkdirSync(INBOX_DIR, { recursive: true })
           writeFileSync(tmpPath, buf)
@@ -1606,13 +1619,9 @@ bot.on('message:voice', async ctx => {
             sttFailed = true
             dlog(sttSeq, 'stt_error', `exhausted retries: exit=${result.status}, stderr=${result.stderr?.slice(0, 200)}`)
           }
-        } else {
-          sttFailed = true
-          dlog(sttSeq, 'stt_download_failed', `http=${res.status}`)
-        }
       } else {
         sttFailed = true
-        dlog(sttSeq, 'stt_no_file_path', 'Telegram returned no file_path')
+        dlog(sttSeq, 'stt_download_failed', sawFilePath ? 'getFile/fetch failed after retries' : 'Telegram returned no file_path')
       }
     } catch (err) {
       sttFailed = true
@@ -1627,14 +1636,25 @@ bot.on('message:voice', async ctx => {
   }
 
   if (sttSucceeded && text.trim().length > 0) {
-    try {
-      await ctx.api.sendMessage(ctx.chat.id, `🎤 "${text}"`, {
-        reply_parameters: { message_id: ctx.message.message_id },
-      })
-      dlog(sttSeq, 'stt_echo_sent', `chars=${text.length}`)
-    } catch (err) {
-      process.stderr.write(`telegram channel: stt echo-back failed: ${String(err)}\n`)
-      dlog(sttSeq, 'stt_echo_failed', String(err))
+    // Echo with retry — sendMessage to api.telegram.org is network-fragile;
+    // transient proxy/SSH-tunnel blips were a dominant STT-failure cause (2026-05-28 fix A)
+    let echoOk = false
+    for (let echoAttempt = 1; echoAttempt <= 3; echoAttempt++) {
+      try {
+        await ctx.api.sendMessage(ctx.chat.id, `🎤 "${text}"`, {
+          reply_parameters: { message_id: ctx.message.message_id },
+        })
+        dlog(sttSeq, 'stt_echo_sent', `chars=${text.length}, attempts=${echoAttempt}`)
+        echoOk = true
+        break
+      } catch (err) {
+        dlog(sttSeq, 'stt_echo_retry', `attempt=${echoAttempt} failed: ${String(err)}`)
+        if (echoAttempt < 3) await new Promise(r => setTimeout(r, [500, 1500][echoAttempt - 1]))
+      }
+    }
+    if (!echoOk) {
+      process.stderr.write(`telegram channel: stt echo-back failed after retries\n`)
+      dlog(sttSeq, 'stt_echo_failed', 'exhausted retries')
     }
   }
 
