@@ -54,15 +54,19 @@ html.hc-open-right, html.hc-open-left { transition: margin .18s ease; }
 .hc-user  { align-self: flex-end;   background: #dcf0ff; }
 .hc-slice { align-self: flex-start; background: #eef0f2; }
 
-/* input area: textarea grows with content (JS auto-grow) up to max-height then
-   scrolls internally; Send stays bottom-aligned with the (taller) textarea.
-   padding-bottom adds breathing room so the input row isn't flush against the
-   panel's bottom edge (align-items:flex-end seats the row above the padding). */
+/* input area: textarea starts ~3 lines tall (min-height) and grows with content
+   (JS auto-grow) up to max-height then scrolls internally; Send stays
+   bottom-aligned with the (taller) textarea. resize:vertical lets the user drag
+   the bottom-right handle to make it taller (max-height bounds the drag). The
+   min-height floor (~3 lines) means the box never shrinks below the default while
+   typing/clearing. padding-bottom adds breathing room so the input row isn't
+   flush against the panel's bottom edge (align-items:flex-end seats the row above
+   the padding). */
 #hc-form { display: flex; align-items: flex-end; border-top: 1px solid #e0e0e0; padding-bottom: 10px; }
 #hc-input {
   flex: 1; border: 0; padding: 9px 10px; font: inherit; outline: none;
-  resize: none; box-sizing: border-box; line-height: 1.4;
-  min-height: 38px; max-height: 132px; overflow-y: hidden;
+  resize: vertical; box-sizing: border-box; line-height: 1.4;
+  min-height: 84px; max-height: 220px; overflow-y: hidden;
 }
 #hc-send { border: 0; background: #2b5fb3; color: #fff; padding: 0 14px; min-height: 38px; cursor: pointer; }
 #hc-send:hover { background: #24509c; }
