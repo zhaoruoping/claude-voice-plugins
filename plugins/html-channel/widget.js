@@ -54,16 +54,43 @@
   es.onopen = function () { if (dot) dot.style.background = '#7CFC00'; };
   es.onerror = function () { if (dot) dot.style.background = '#e74c3c'; };
 
-  // send (POST)
-  form.onsubmit = function (ev) {
-    ev.preventDefault();
-    var t = inp.value.trim(); if (!t) return; inp.value = '';
+  // multi-line input: auto-grow the textarea with content (capped by CSS max-height,
+  // then it scrolls internally). Reset to 'auto' first so it shrinks when text is deleted.
+  function autoGrow() {
+    if (!inp) return;
+    inp.style.height = 'auto';
+    inp.style.height = inp.scrollHeight + 'px';
+    inp.style.overflowY = (inp.scrollHeight > inp.clientHeight) ? 'auto' : 'hidden';
+  }
+  function resetInput() {
+    if (!inp) return;
+    inp.value = '';
+    inp.style.height = 'auto';
+    inp.style.overflowY = 'hidden';
+  }
+
+  // send (POST) — same contract as before; content may now contain newlines.
+  function sendMessage() {
+    var t = inp.value.trim(); if (!t) return; resetInput();
     // no optimistic echo — the server echoes the user line back over SSE (role:user)
     fetch('/html-channel/send', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content: t })
     }).catch(function () { add('slice', '[send failed]'); });
-  };
+  }
+
+  if (inp) {
+    inp.addEventListener('input', autoGrow);
+    // Enter = send, Shift+Enter = newline. Guard IME composition (Chinese pinyin):
+    // during composition Enter confirms the candidate and must NOT send.
+    inp.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) {
+        ev.preventDefault();
+        sendMessage();
+      }
+    });
+  }
+  form.onsubmit = function (ev) { ev.preventDefault(); sendMessage(); };
 
   applyState();
 })();

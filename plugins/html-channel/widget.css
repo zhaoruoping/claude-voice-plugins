@@ -48,10 +48,19 @@ html.hc-open-right, html.hc-open-left { transition: margin .18s ease; }
 #hc-head .dot { width: 8px; height: 8px; border-radius: 50%; background: #7CFC00; display: inline-block; margin-left: 4px; }
 
 #hc-log { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
-.hc-msg { padding: 6px 10px; border-radius: 10px; max-width: 88%; white-space: pre-wrap; word-break: break-word; }
+/* multi-line display: pre-wrap keeps newlines; overflow-wrap/word-break let long
+   tokens (file paths, URLs) wrap instead of overflowing the bubble. */
+.hc-msg { padding: 6px 10px; border-radius: 10px; max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .hc-user  { align-self: flex-end;   background: #dcf0ff; }
 .hc-slice { align-self: flex-start; background: #eef0f2; }
 
-#hc-form { display: flex; border-top: 1px solid #e0e0e0; }
-#hc-input { flex: 1; border: 0; padding: 10px; font: inherit; outline: none; }
-#hc-send { border: 0; background: #2b5fb3; color: #fff; padding: 0 14px; cursor: pointer; }
+/* input area: textarea grows with content (JS auto-grow) up to max-height then
+   scrolls internally; Send stays bottom-aligned with the (taller) textarea. */
+#hc-form { display: flex; align-items: flex-end; border-top: 1px solid #e0e0e0; }
+#hc-input {
+  flex: 1; border: 0; padding: 9px 10px; font: inherit; outline: none;
+  resize: none; box-sizing: border-box; line-height: 1.4;
+  min-height: 38px; max-height: 132px; overflow-y: hidden;
+}
+#hc-send { border: 0; background: #2b5fb3; color: #fff; padding: 0 14px; min-height: 38px; cursor: pointer; }
+#hc-send:hover { background: #24509c; }
