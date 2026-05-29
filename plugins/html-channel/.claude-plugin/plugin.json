@@ -1,7 +1,7 @@
 {
   "name": "html-channel",
   "description": "Thin MCP client to the central html-msg-broker \u2014 N-bot \u00d7 N-page pubsub chat. Does NOT spawn an HTTP server (replaces v0.2.x's per-bot bun child). Frontends are independent processes (tools/html_chat_frontend.py); see general/html_msg_broker_dev/DESIGN.md.",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "keywords": [
     "html",
     "channel",

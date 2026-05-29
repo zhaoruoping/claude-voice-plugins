@@ -1,46 +1,41 @@
-/* html-channel chat widget — DOCKED side panel that REFLOWS page content
-   (never a floating overlay). Read per-request by the server → hot-reloadable:
-   edit this file + refresh the page; no slice restart needed.
-   Does NOT touch the report's own left TOC sidebar — the chat is a SEPARATE
-   right (or left) column; reflow is achieved by margin on <html>. */
+/* html-channel chat widget — FLOATING, draggable + resizable panel (v0.3.5).
+   Read per-request by the server → hot-reloadable: edit this file + refresh the
+   page; no slice restart needed. The panel FLOATS over page content (overlay, no
+   page reflow): widget.js sets position:fixed left/top/width/height from
+   localStorage (key `hc_panel_geom`). Drag the header (#hc-head) to move; drag the
+   bottom-right grip (CSS resize:both) to resize the whole box; geometry persists
+   across reloads (clamped back on-screen on load). The header "reset" button
+   (⤢, repurposed from the old dock toggle) restores the default position+size. */
 
-:root { --hc-w: 330px; }
-
-/* Reflow: shrink the document box so nothing hides behind the chat.
-   !important beats a report's own `html{margin:0}`. Fixed elements (the report's
-   left TOC) are unaffected; normal-flow content (center column) reflows. */
-html.hc-open-right { margin-right: var(--hc-w) !important; }
-html.hc-open-left  { margin-left:  var(--hc-w) !important; }
-html.hc-open-right, html.hc-open-left { transition: margin .18s ease; }
+:root { --hc-w: 340px; }
 
 #hc-panel {
-  position: fixed; top: 0; bottom: 0; width: var(--hc-w);
+  position: fixed;                 /* left/top/width/height set by widget.js (drag+resize, persisted) */
+  top: 56px; width: var(--hc-w); height: 70vh;   /* fallback geometry before JS runs */
   background: #fff; z-index: 2147483646;
   display: flex; flex-direction: column;
-  box-shadow: 0 0 18px rgba(0,0,0,.16);
+  box-shadow: 0 0 18px rgba(0,0,0,.20);
+  border: 1px solid #c8c8c8; border-radius: 8px;
   font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
-  transition: transform .18s ease;
+  overflow: hidden;               /* clips rounded children + REQUIRED for the CSS resize grip */
+  resize: both;                   /* drag the bottom-right grip to resize the WHOLE panel */
+  min-width: 260px; min-height: 220px; max-width: 96vw; max-height: 94vh;
 }
-#hc-panel.hc-dock-right { right: 0; border-left: 1px solid #c8c8c8; }
-#hc-panel.hc-dock-left  { left: 0;  border-right: 1px solid #c8c8c8; }
-/* collapsed → slide the panel fully off its docked edge (tab stays) */
-#hc-panel.hc-collapsed.hc-dock-right { transform: translateX(100%); }
-#hc-panel.hc-collapsed.hc-dock-left  { transform: translateX(-100%); }
 
-/* the always-available toggle tab (shown only when collapsed) */
+/* the always-available toggle tab (shown only when collapsed), pinned to the right edge */
 #hc-tab {
-  position: fixed; top: 96px; z-index: 2147483647;
+  position: fixed; top: 96px; right: 0; z-index: 2147483647;
   background: #2b5fb3; color: #fff; border: 0; cursor: pointer;
   padding: 12px 6px; writing-mode: vertical-rl;
   font: 600 12px/1 sans-serif; letter-spacing: .5px;
+  border-radius: 6px 0 0 6px;
   box-shadow: 0 2px 8px rgba(0,0,0,.25);
 }
-#hc-tab.hc-dock-right { right: 0; border-radius: 6px 0 0 6px; }
-#hc-tab.hc-dock-left  { left: 0;  border-radius: 0 6px 6px 0; }
 
 #hc-head {
   padding: 8px 12px; background: #2b5fb3; color: #fff; font-weight: 600;
   display: flex; justify-content: space-between; align-items: center; gap: 6px;
+  cursor: move; user-select: none;   /* drag handle: grab here to move the panel */
 }
 #hc-head .hc-btns { display: flex; gap: 10px; }
 #hc-head button { background: transparent; border: 0; color: #fff; cursor: pointer; font-size: 15px; line-height: 1; opacity: .9; }
@@ -56,17 +51,17 @@ html.hc-open-right, html.hc-open-left { transition: margin .18s ease; }
 
 /* input area: textarea starts ~3 lines tall (min-height) and grows with content
    (JS auto-grow) up to max-height then scrolls internally; Send stays
-   bottom-aligned with the (taller) textarea. resize:vertical lets the user drag
-   the bottom-right handle to make it taller (max-height bounds the drag). The
-   min-height floor (~3 lines) means the box never shrinks below the default while
-   typing/clearing. padding-bottom adds breathing room so the input row isn't
-   flush against the panel's bottom edge (align-items:flex-end seats the row above
-   the padding). */
+   bottom-aligned with the (taller) textarea. resize:none — the WHOLE PANEL is
+   draggable+resizable (see #hc-panel), so the textarea itself has no separate
+   drag handle. The min-height floor (~3 lines) means the box never shrinks below
+   the default while typing/clearing. padding-bottom adds breathing room so the
+   input row isn't flush against the panel's bottom edge (align-items:flex-end
+   seats the row above the padding). */
 #hc-form { display: flex; align-items: flex-end; border-top: 1px solid #e0e0e0; padding-bottom: 10px; }
 #hc-input {
   flex: 1; border: 0; padding: 9px 10px; font: inherit; outline: none;
-  resize: vertical; box-sizing: border-box; line-height: 1.4;
-  min-height: 84px; max-height: 220px; overflow-y: hidden;
+  resize: none; box-sizing: border-box; line-height: 1.4;
+  min-height: 84px; max-height: 132px; overflow-y: hidden;
 }
 #hc-send { border: 0; background: #2b5fb3; color: #fff; padding: 0 14px; min-height: 38px; cursor: pointer; }
 #hc-send:hover { background: #24509c; }

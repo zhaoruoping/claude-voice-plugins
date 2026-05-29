@@ -1,45 +1,95 @@
 /* html-channel chat widget logic (injected before </body>; read per-request → hot-reloadable).
-   Docked side panel that reflows content; collapse/expand + left/right dock; state persisted.
-   Keeps the SSE /html-channel/stream + POST /html-channel/send contract + offline (no CDN). */
+   FLOATING panel (v0.3.5): drag the header to move, drag the bottom-right grip (CSS resize:both)
+   to resize the whole box; position+size persist to localStorage (hc_panel_geom). Collapse to a
+   right-edge tab. Keeps the SSE /html-channel/stream + POST /html-channel/send contract + offline
+   (no CDN). Does NOT touch the page-aware shim (window.__hcSetPageId is injected separately by the
+   frontend, BEFORE this widget) — only the panel chrome lives here. */
 (function () {
-  var html = document.documentElement;
   var panel = document.getElementById('hc-panel');
   var tab = document.getElementById('hc-tab');
+  var head = document.getElementById('hc-head');
   var log = document.getElementById('hc-log');
   var form = document.getElementById('hc-form');
   var inp = document.getElementById('hc-input');
   var dot = document.getElementById('hc-dot');
   if (!panel || !tab) return;
 
-  // persisted UI state
-  var LS = 'hc_ui_v1';
-  var st = { collapsed: false, dock: 'right' };
+  // ---- persisted geometry + collapsed state (single key) ----
+  var LS = 'hc_panel_geom';
+  var st = { left: null, top: null, width: null, height: null, collapsed: false };
   try { st = Object.assign(st, JSON.parse(localStorage.getItem(LS) || '{}')); } catch (e) {}
   function save() { try { localStorage.setItem(LS, JSON.stringify(st)); } catch (e) {} }
 
-  function applyState() {
-    html.classList.remove('hc-open-right', 'hc-open-left');
-    panel.classList.remove('hc-dock-right', 'hc-dock-left', 'hc-collapsed');
-    tab.classList.remove('hc-dock-right', 'hc-dock-left');
-    panel.classList.add('hc-dock-' + st.dock);
-    tab.classList.add('hc-dock-' + st.dock);
-    tab.textContent = st.dock === 'right' ? 'CHAT ◂' : 'CHAT ▸';
-    if (st.collapsed) {
-      panel.classList.add('hc-collapsed');
-      tab.style.display = 'block';            // show the re-open tab
-    } else {
-      html.classList.add('hc-open-' + st.dock); // reflow page content
-      tab.style.display = 'none';
-    }
+  var MINW = 260, MINH = 220, MARGIN = 8;
+  // Fill any missing geometry with defaults + clamp everything back on-screen
+  // (handles first load, viewport shrink, and "panel saved off-screen" recovery).
+  function clampGeom() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var w = st.width || 340;
+    var h = st.height || Math.min(Math.round(vh * 0.7), 560);
+    w = Math.max(MINW, Math.min(w, vw - 2 * MARGIN));
+    h = Math.max(MINH, Math.min(h, vh - 2 * MARGIN));
+    var left = (st.left == null) ? (vw - w - 12) : st.left;
+    var top  = (st.top  == null) ? 56 : st.top;
+    left = Math.max(MARGIN, Math.min(left, vw - w - MARGIN));
+    top  = Math.max(MARGIN, Math.min(top,  vh - 40));   // keep the header grabbable
+    st.left = left; st.top = top; st.width = w; st.height = h;
+  }
+  function applyGeom() {
+    panel.style.left = st.left + 'px';
+    panel.style.top = st.top + 'px';
+    panel.style.width = st.width + 'px';
+    panel.style.height = st.height + 'px';
+  }
+  function applyCollapsed() {
+    if (st.collapsed) { panel.style.display = 'none'; tab.style.display = 'block'; }
+    else { panel.style.display = 'flex'; tab.style.display = 'none'; }
   }
 
-  document.getElementById('hc-collapse').onclick = function () { st.collapsed = true; save(); applyState(); };
-  tab.onclick = function () { st.collapsed = false; save(); applyState(); };
-  document.getElementById('hc-dockbtn').onclick = function () {
-    st.dock = (st.dock === 'right') ? 'left' : 'right'; save(); applyState();
+  // collapse → hide to tab; tab → restore
+  document.getElementById('hc-collapse').onclick = function () { st.collapsed = true; save(); applyCollapsed(); };
+  tab.onclick = function () { st.collapsed = false; save(); applyCollapsed(); };
+  // reset position+size (repurposed from the old dock-toggle button)
+  var resetBtn = document.getElementById('hc-dockbtn');
+  if (resetBtn) resetBtn.onclick = function () {
+    st.left = null; st.top = null; st.width = null; st.height = null;
+    clampGeom(); applyGeom(); save();
   };
 
-  // chat bubbles
+  // ---- drag the panel by its header ----
+  var drag = null;
+  if (head) head.addEventListener('mousedown', function (e) {
+    if (e.target.closest('button')) return;          // clicking a header button must not start a drag
+    drag = { x: e.clientX, y: e.clientY, left: st.left, top: st.top };
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!drag) return;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var nl = drag.left + (e.clientX - drag.x);
+    var nt = drag.top  + (e.clientY - drag.y);
+    nl = Math.max(MARGIN, Math.min(nl, vw - panel.offsetWidth - MARGIN));
+    nt = Math.max(MARGIN, Math.min(nt, vh - 40));
+    st.left = nl; st.top = nt;
+    panel.style.left = nl + 'px'; panel.style.top = nt + 'px';
+  });
+  window.addEventListener('mouseup', function () {
+    if (drag) { drag = null; document.body.style.userSelect = ''; save(); }
+  });
+
+  // ---- persist size after the user drags the CSS resize grip ----
+  if (window.ResizeObserver) {
+    var ro = new ResizeObserver(function () {
+      if (st.collapsed || panel.offsetWidth === 0) return;   // ignore while hidden
+      st.width = panel.offsetWidth; st.height = panel.offsetHeight; save();
+    });
+    ro.observe(panel);
+  }
+  // keep the panel on-screen if the window is resized
+  window.addEventListener('resize', function () { clampGeom(); applyGeom(); });
+
+  // ---- chat bubbles ----
   function add(role, content) {
     var d = document.createElement('div');
     d.className = 'hc-msg ' + (role === 'user' ? 'hc-user' : 'hc-slice');
@@ -69,7 +119,7 @@
     inp.style.overflowY = 'hidden';
   }
 
-  // send (POST) — same contract as before; content may now contain newlines.
+  // send (POST) — same contract as before; content may contain newlines.
   function sendMessage() {
     var t = inp.value.trim(); if (!t) return; resetInput();
     // no optimistic echo — the server echoes the user line back over SSE (role:user)
@@ -92,5 +142,6 @@
   }
   form.onsubmit = function (ev) { ev.preventDefault(); sendMessage(); };
 
-  applyState();
+  // init: place + size the floating panel, then apply collapsed state
+  clampGeom(); applyGeom(); applyCollapsed();
 })();
