@@ -1,10 +1,11 @@
-<!-- html-channel chat widget DOM (injected before </body>; read per-request → hot-reloadable). -->
-<button id="hc-tab" class="hc-dock-right" title="open editor chat">CHAT ◂</button>
-<div id="hc-panel" class="hc-dock-right">
+<!-- html-channel chat widget DOM (injected before </body>; read per-request → hot-reloadable).
+     Embedded DOCKED right-side column (v0.3.6): part of the page layout (reflows content,
+     mirrors the left sidebar), not a floating overlay. Collapse hides it to the right-edge tab. -->
+<button id="hc-tab" title="open page chat">CHAT ◂</button>
+<div id="hc-panel">
   <div id="hc-head">
-    <span>editor chat<span class="dot" id="hc-dot"></span></span>
+    <span>page chat<span class="dot" id="hc-dot"></span></span>
     <span class="hc-btns">
-      <button id="hc-dockbtn" title="reset position &amp; size">⤢</button>
       <button id="hc-collapse" title="hide (reading mode)">—</button>
     </span>
   </div>

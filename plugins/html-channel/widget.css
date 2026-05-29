@@ -1,26 +1,30 @@
-/* html-channel chat widget — FLOATING, draggable + resizable panel (v0.3.5).
+/* html-channel chat widget — EMBEDDED docked RIGHT-SIDE column (v0.3.6).
    Read per-request by the server → hot-reloadable: edit this file + refresh the
-   page; no slice restart needed. The panel FLOATS over page content (overlay, no
-   page reflow): widget.js sets position:fixed left/top/width/height from
-   localStorage (key `hc_panel_geom`). Drag the header (#hc-head) to move; drag the
-   bottom-right grip (CSS resize:both) to resize the whole box; geometry persists
-   across reloads (clamped back on-screen on load). The header "reset" button
-   (⤢, repurposed from the old dock toggle) restores the default position+size. */
+   page; no slice restart needed. The panel is PART OF THE LAYOUT (mirrors the left
+   sidebar): it pins to the right edge full-height and REFLOWS page content via a
+   margin-right on <html> (widget.js toggles the .hc-open-right class) so it never
+   overlaps. Collapse hides it to a right-edge tab and releases the margin. Each
+   page keeps its own conversation history in localStorage (key hc_log_<page_id>),
+   restored on load + on SPA page-switch. (No floating/drag/resize — that was v0.3.5.) */
 
 :root { --hc-w: 340px; }
 
+/* Reflow: shrink the document box so page content never hides behind the chat
+   column. !important beats a page's own `html{margin:0}`. The dashboard's flex
+   .layout (left sidebar + main) reflows into the narrowed width automatically. */
+html.hc-open-right { margin-right: var(--hc-w) !important; transition: margin .18s ease; }
+
 #hc-panel {
-  position: fixed;                 /* left/top/width/height set by widget.js (drag+resize, persisted) */
-  top: 56px; width: var(--hc-w); height: 70vh;   /* fallback geometry before JS runs */
+  position: fixed; top: 0; right: 0; bottom: 0; width: var(--hc-w);
   background: #fff; z-index: 2147483646;
   display: flex; flex-direction: column;
-  box-shadow: 0 0 18px rgba(0,0,0,.20);
-  border: 1px solid #c8c8c8; border-radius: 8px;
+  border-left: 1px solid #d0d7de;          /* mirrors the left sidebar's border-right */
+  box-shadow: -2px 0 8px rgba(0,0,0,.05);
   font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
-  overflow: hidden;               /* clips rounded children + REQUIRED for the CSS resize grip */
-  resize: both;                   /* drag the bottom-right grip to resize the WHOLE panel */
-  min-width: 260px; min-height: 220px; max-width: 96vw; max-height: 94vh;
+  transition: transform .18s ease;
 }
+/* collapsed → slide the column off the right edge (tab stays); margin released by JS */
+#hc-panel.hc-collapsed { transform: translateX(100%); }
 
 /* the always-available toggle tab (shown only when collapsed), pinned to the right edge */
 #hc-tab {
@@ -35,7 +39,7 @@
 #hc-head {
   padding: 8px 12px; background: #2b5fb3; color: #fff; font-weight: 600;
   display: flex; justify-content: space-between; align-items: center; gap: 6px;
-  cursor: move; user-select: none;   /* drag handle: grab here to move the panel */
+  user-select: none;   /* section header (no longer a drag handle) */
 }
 #hc-head .hc-btns { display: flex; gap: 10px; }
 #hc-head button { background: transparent; border: 0; color: #fff; cursor: pointer; font-size: 15px; line-height: 1; opacity: .9; }
