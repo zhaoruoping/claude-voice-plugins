@@ -1055,6 +1055,51 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+// ── Outbound-send resilience (transient network retry + markdown degrade) ──
+// api.telegram.org over the workstation proxy is network-fragile: grammy raises
+// HttpError ("Network request for 'X' failed!") and Bun fetch raises "The socket
+// connection was closed unexpectedly" on transient drops. These used to surface
+// immediately to the MCP caller, forcing Claude to re-call the whole tool (slow
+// + a wasted turn). We retry transient failures in-process instead.
+//
+// Retry policy:
+//   • network-layer throw (grammy HttpError / fetch socket error)  → retry
+//   • Telegram 429 (honor retry_after) and 5xx                     → retry
+//   • Telegram 4xx (400 parse-entity / 403 blocked / 404 no chat)  → do NOT
+//     retry — deterministic, a retry can't help.
+// Duplicate-send risk exists only in the narrow "delivered-but-response-lost"
+// window (Telegram exposes no idempotency key); empirically rare on this link
+// because drops are predominantly at the connect/request stage (TG never
+// received the message). No worse than the status quo, where Claude already
+// re-issued the same call on the same errors — just faster and turn-free.
+class TgApiError extends Error {
+  constructor(public code: number, message: string) { super(message) }
+}
+const SEND_RETRY_BACKOFF_MS = [400, 1200, 2500]  // sleeps before attempts 2,3,4
+function isTransientSendError(err: unknown): boolean {
+  const code = err instanceof GrammyError ? err.error_code
+    : err instanceof TgApiError ? err.code
+    : undefined
+  if (code !== undefined) return code === 429 || (code >= 500 && code <= 599)
+  const m = (err instanceof Error ? err.message : String(err)).toLowerCase()
+  return /network request for .* failed|socket connection was closed|fetch failed|econnreset|etimedout|enotfound|terminated|socket hang up|other side closed|und_err/.test(m)
+}
+async function withSendRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = SEND_RETRY_BACKOFF_MS.length + 1
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (!isTransientSendError(err) || attempt >= maxAttempts) throw err
+      let backoff = SEND_RETRY_BACKOFF_MS[attempt - 1]
+      if (err instanceof GrammyError && err.parameters?.retry_after) {
+        backoff = Math.max(backoff, err.parameters.retry_after * 1000)
+      }
+      await new Promise(r => setTimeout(r, backoff))
+    }
+  }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
@@ -1084,16 +1129,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
+        let parseFallbackUsed = false
         try {
           for (let i = 0; i < chunks.length; i++) {
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
+            const replyOpt = shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}
+            let sent
+            try {
+              sent = await withSendRetry(() => bot.api.sendMessage(chat_id, chunks[i], {
+                ...replyOpt,
+                ...(parseMode ? { parse_mode: parseMode } : {}),
+              }))
+            } catch (err) {
+              // Malformed MarkdownV2 is a deterministic 400 — a retry can't fix
+              // it. Degrade to plain text so the message still lands (literal
+              // text) instead of failing the whole call.
+              if (parseMode && err instanceof GrammyError && err.error_code === 400 &&
+                  /can't parse entities/i.test(err.description ?? '')) {
+                sent = await withSendRetry(() => bot.api.sendMessage(chat_id, chunks[i], { ...replyOpt }))
+                parseFallbackUsed = true
+              } else {
+                throw err
+              }
+            }
             sentIds.push(sent.message_id)
           }
         } catch (err) {
@@ -1125,27 +1186,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               : 'application/octet-stream')
             : 'application/octet-stream'
           const buf = readFileSync(f)
-          const formData = new FormData()
-          formData.append('chat_id', chat_id)
-          formData.append(fieldName, new Blob([buf], { type: mime }), basename(f))
-          if (reply_to != null && replyMode !== 'off') {
-            formData.append('reply_parameters', JSON.stringify({ message_id: reply_to }))
-          }
-          const sendRes = await fetch(`https://api.telegram.org/bot${TOKEN}/${endpoint}`, {
-            method: 'POST',
-            body: formData,
+          // Rebuild FormData inside the retry closure — a fetch body (Blob/
+          // FormData) is single-use, so a retry needs a fresh one. buf stays
+          // in memory and is cheap to re-wrap.
+          const sendData = await withSendRetry(async () => {
+            const formData = new FormData()
+            formData.append('chat_id', chat_id)
+            formData.append(fieldName, new Blob([buf], { type: mime }), basename(f))
+            if (reply_to != null && replyMode !== 'off') {
+              formData.append('reply_parameters', JSON.stringify({ message_id: reply_to }))
+            }
+            const sendRes = await fetch(`https://api.telegram.org/bot${TOKEN}/${endpoint}`, {
+              method: 'POST',
+              body: formData,
+            })
+            const data = await sendRes.json() as any
+            if (!data.ok) {
+              throw new TgApiError(data.error_code ?? 0, `${endpoint} failed for ${basename(f)}: ${data.error_code ?? '?'} ${data.description ?? JSON.stringify(data)}`)
+            }
+            return data
           })
-          const sendData = await sendRes.json() as any
-          if (!sendData.ok) {
-            throw new Error(`${endpoint} failed for ${basename(f)}: ${sendData.error_code ?? '?'} ${sendData.description ?? JSON.stringify(sendData)}`)
-          }
           sentIds.push(sendData.result.message_id)
         }
 
         const result =
-          sentIds.length === 1
+          (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`)
+          + (parseFallbackUsed
+              ? ' [markdownv2 parse failed → sent as PLAIN TEXT; fix your escaping next time]'
+              : '')
         chatLog('BOT', text)
         // Track assistant reply for memory enhancement context
         if (memoryEnhancementEnabled) {
@@ -1157,9 +1227,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
-        await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+        await withSendRetry(() => bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
-        ])
+        ]))
         ackMessage()
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
@@ -1175,17 +1245,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // configured TTS. The hint message is returned to Claude (not the
         // end user) so Claude can prompt the user to configure the key.
         if (!process.env.MINIMAX_API_KEY || !process.env.MINIMAX_GROUP_ID) {
-          const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id,
-              text,
-              ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
-            }),
+          const data = await withSendRetry(async () => {
+            const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id,
+                text,
+                ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+              }),
+            })
+            const d = await res.json() as any
+            if (!d.ok) throw new TgApiError(d.error_code ?? 0, `sendMessage fallback failed: ${JSON.stringify(d)}`)
+            return d
           })
-          const data = await res.json() as any
-          if (!data.ok) throw new Error(`sendMessage fallback failed: ${JSON.stringify(data)}`)
           chatLog('BOT', `[voice->text fallback] ${text}`)
           ackMessage()
           return {
@@ -1213,23 +1286,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!oggMatch) throw new Error('TTS did not produce OGG output')
         const oggPath = oggMatch[1].trim()
 
-        // Use fetch + FormData to bypass grammy's file upload (proxy issues)
+        // Use fetch + FormData to bypass grammy's file upload (proxy issues).
+        // Rebuild FormData inside the retry closure (single-use body); oggBuf
+        // is read once and re-wrapped per attempt.
         const oggBuf = readFileSync(oggPath)
-        const formData = new FormData()
-        formData.append('chat_id', chat_id)
-        formData.append('voice', new Blob([oggBuf], { type: 'audio/ogg' }), 'voice.ogg')
-        formData.append('caption', text)
-        if (reply_to != null) {
-          formData.append('reply_parameters', JSON.stringify({ message_id: reply_to }))
-        }
-        const sendRes = await fetch(`https://api.telegram.org/bot${TOKEN}/sendVoice`, {
-          method: 'POST',
-          body: formData,
+        const sendData = await withSendRetry(async () => {
+          const formData = new FormData()
+          formData.append('chat_id', chat_id)
+          formData.append('voice', new Blob([oggBuf], { type: 'audio/ogg' }), 'voice.ogg')
+          formData.append('caption', text)
+          if (reply_to != null) {
+            formData.append('reply_parameters', JSON.stringify({ message_id: reply_to }))
+          }
+          const sendRes = await fetch(`https://api.telegram.org/bot${TOKEN}/sendVoice`, {
+            method: 'POST',
+            body: formData,
+          })
+          const d = await sendRes.json() as any
+          if (!d.ok) throw new TgApiError(d.error_code ?? 0, `sendVoice failed: ${JSON.stringify(d)}`)
+          return d
         })
-        const sendData = await sendRes.json() as any
         try { unlinkSync(oggPath) } catch {}
         try { unlinkSync(oggPath.replace(/\.ogg$/, '.mp3')) } catch {}
-        if (!sendData.ok) throw new Error(`sendVoice failed: ${JSON.stringify(sendData)}`)
         chatLog('BOT', `[voice] ${text}`)
         ackMessage()
         return { content: [{ type: 'text', text: `sent (id: ${sendData.result.message_id})` }] }
@@ -1256,12 +1334,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
-        const edited = await bot.api.editMessageText(
+        const edited = await withSendRetry(() => bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
           args.text as string,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
-        )
+        ))
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         ackMessage()
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
