@@ -293,6 +293,17 @@ class BrokerClient {
   }
 
   onData(chunk: string): void {
+    // Manually reset the idle-timeout timer on incoming activity.
+    // Bug fix 2026-06-05: Bun's net.Socket.setTimeout does NOT auto-reset
+    // on receive (Node.js standard behavior — Bun compat gap). Without
+    // this explicit reset, the 120s SOCKET_IDLE_TIMEOUT_MS fires from
+    // CONNECT time regardless of heartbeats received, causing a 2-min
+    // EOF + reconnect cycle even when the broker is emitting periodic
+    // platform_status heartbeats. Calling setTimeout(N) re-arms the timer
+    // for N more ms — counterpart to the broker's 30s heartbeat.
+    if (this.socket) {
+      try { this.socket.setTimeout(SOCKET_IDLE_TIMEOUT_MS) } catch {}
+    }
     this.inboundBuf += chunk
     let idx: number
     while ((idx = this.inboundBuf.indexOf('\n')) >= 0) {

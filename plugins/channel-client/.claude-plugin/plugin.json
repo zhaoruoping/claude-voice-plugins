@@ -1,7 +1,7 @@
 {
   "name": "channel-client",
   "description": "Unified thin MCP client to channel-msg-broker \u2014 TG + HTML (+ future weixin/feishu) on one Unix socket. Replaces channel-tg-client + channel-html-client. ONE conn / ONE register (platform-less) / ONE MCP server carries BOTH planes: TG (reply / react / voice_reply / edit_message / download_attachment / send_typing) and HTML-channel (html_bind / html_unbind / html_reply / html_list_pages / html_self). Primary unified tool send_message({channel,target,content,...}) discriminates by channel arg; legacy tool names preserved as compat wrappers for existing bot prompts. Per general/channel_broker_design/DESIGN.md (Q7 flipped 2026-06-05 from SEPARATE \u2192 UNIFIED).",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "keywords": [
     "channel",
     "broker",
