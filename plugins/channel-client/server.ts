@@ -1,6 +1,16 @@
 #!/usr/bin/env bun
 /**
- * channel-client v0.2.5 — UNIFIED thin MCP client to the central channel-msg-broker.
+ * channel-client v0.2.6 — UNIFIED thin MCP client to the central channel-msg-broker.
+ * v0.2.6 (2026-06-06): reconnect watchdog backstop. After 2026-06-05 broker
+ * restart left Probe/Patrick/Alice/Oscar with bun processes alive but socket-
+ * stuck (setTimeout-based reconnect ladder fired once, the subsequent timer
+ * callback was never invoked under Bun, teardownScheduled stayed true and
+ * every later 'end'/'close'/'error'/'timeout' event was no-op'd → no fd to
+ * broker in /proc/$pid/fd, process state=S utime=0). The watchdog (10s
+ * setInterval, unref'd) detects (a) "scheduled reconnect overdue by >10s
+ * past its nextReconnectAt epoch" and (b) "no pending reconnect but also
+ * not connected" and force-clears state + connect()s. See WATCHDOG block
+ * comment in BrokerClient for the full rationale.
  * v0.2.5 (2026-06-05): add SLICE plane on the same conn — `slice_send` /
  * `slice_self` MCP tools + inbound `slice_msg` events surfaced as
  * <channel source="slice-channel"> notifications. Replaces the standalone
@@ -179,6 +189,35 @@ class BrokerClient {
   // socket schedules only one reconnect.
   private teardownScheduled = false
 
+  // ── Watchdog backstop (v0.2.6, 2026-06-06) ─────────────────────────────
+  // Anchor incident: 2026-06-05 broker restart left Probe/Patrick/Alice/Oscar
+  // bun processes alive but socket-stuck — channel-client's setTimeout-based
+  // reconnect ladder fired once (the 'end' event from the broker FIN), but the
+  // subsequent setTimeout callback was apparently never invoked under Bun, so
+  // teardownScheduled stayed true forever and every later 'end'/'close'/'error'
+  // event was no-op'd. The process kept its event loop alive (fd 3 epoll, fd 4
+  // timerfd, fd 5 eventfd all present) but no reconnect attempt ever ran. The
+  // only known-good remediation pre-v0.2.6 was killing the bot and re-launching.
+  //
+  // The fix here is a backstop that does NOT trust the reconnect setTimeout:
+  //   1. A 10s setInterval watchdog runs from start(). It checks: are we
+  //      connected? If not, is a reconnect scheduled and is its nextReconnectAt
+  //      epoch >10s in the past? If both yes (overdue), the setTimeout was
+  //      dropped → clear it, reset teardownScheduled, force connect() now.
+  //   2. If no reconnect is scheduled AND we're not connected, scheduleReconnect
+  //      immediately (covers a "missed all socket events" failure mode).
+  //   3. The watchdog interval is .unref()'d so it never keeps the process alive
+  //      beyond useful work; once the only Node user has exited it dies clean.
+  // setInterval uses the same timer backend as setTimeout in Bun, so this
+  // doesn't help if the timer backend itself is globally stuck — but in the
+  // 2026-06-05 observed failure the timer backend (fd 4 timerfd) was still
+  // armed and event loop alive (fd 3 epoll). What was wedged was the JS-level
+  // teardownScheduled state machine. A second-track interval that re-arms each
+  // tick exercises the timer backend and resets the JS state.
+  private pendingReconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private nextReconnectAt = 0  // Date.now() of the next scheduled attempt
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null
+
   // HTML-plane state — pages currently bound (replayed on reconnect).
   pages = new Set<string>()
   activePage: string | null = null
@@ -190,7 +229,48 @@ class BrokerClient {
   // register is platform-less.
 
   async start(): Promise<void> {
+    // Start the watchdog FIRST — it's an event-loop backstop independent of
+    // the per-socket event callbacks. See the WATCHDOG block above for why.
+    if (this.watchdogTimer == null) {
+      this.watchdogTimer = setInterval(() => this.watchdogTick(), 10000)
+      // Don't keep the process alive solely for the watchdog.
+      if (this.watchdogTimer && typeof (this.watchdogTimer as any).unref === 'function') {
+        (this.watchdogTimer as any).unref()
+      }
+    }
     this.connect()
+  }
+
+  private watchdogTick(): void {
+    // Healthy path: connected with a live socket → no-op.
+    if (this.connected && this.socket && !this.socket.destroyed) return
+    const now = Date.now()
+    if (this.pendingReconnectTimer != null) {
+      // A reconnect was scheduled. If we're well past the scheduled time
+      // (10s grace), the underlying setTimeout was dropped — force connect.
+      if (now > this.nextReconnectAt + 10000) {
+        const overdueMs = now - this.nextReconnectAt
+        process.stderr.write(
+          `[channel-client] WATCHDOG: reconnect overdue by ${overdueMs}ms ` +
+          `(scheduled for ${this.nextReconnectAt}, now ${now}) — ` +
+          `clearing stale timer + force connect\n`
+        )
+        try { clearTimeout(this.pendingReconnectTimer) } catch {}
+        this.pendingReconnectTimer = null
+        // Reset the state machine so connect() doesn't get stuck.
+        this.teardownScheduled = false
+        this.connect()
+      }
+      return
+    }
+    // No pending reconnect AND not connected → schedule one now. This covers
+    // the case where every socket event ('end' / 'close' / 'error' / 'timeout')
+    // was missed for the previous attempt.
+    process.stderr.write(
+      `[channel-client] WATCHDOG: not connected and no pending reconnect — scheduling now\n`
+    )
+    this.teardownScheduled = false  // ensure scheduleReconnect proceeds
+    this.scheduleReconnect('watchdog')
   }
 
   connect(): void {
@@ -198,6 +278,12 @@ class BrokerClient {
       `channel-client: connecting broker ${BROKER_SOCK} (attempt ${this.attemptIdx + 1})\n`
     )
     this.teardownScheduled = false
+    // Clear any pending reconnect timer — connect() itself is the recovery,
+    // so any future tick of the timer would be a stale double-attempt.
+    if (this.pendingReconnectTimer != null) {
+      try { clearTimeout(this.pendingReconnectTimer) } catch {}
+      this.pendingReconnectTimer = null
+    }
     const s = net.createConnection({ path: BROKER_SOCK })
     this.socket = s
     s.setEncoding('utf8')
@@ -298,18 +384,24 @@ class BrokerClient {
 
   // Schedule a reconnect. Idempotent for the lifetime of one socket — multiple
   // events (end + close + error + timeout) firing for the SAME conn collapse
-  // into a single reconnect.
+  // into a single reconnect. The watchdog (above) is the back-stop in case
+  // the setTimeout callback is dropped by the underlying Bun/Node timer.
   private scheduleReconnect(reason: string): void {
     if (this.teardownScheduled) return
     this.teardownScheduled = true
     this.connected = false
     const delay = this.nextReconnectMs()
     const upcomingAttempt = this.attemptIdx + 1
+    this.nextReconnectAt = Date.now() + delay
     process.stderr.write(
       `[channel-client] broker socket EOF (${reason}); reconnecting in ${delay}ms ` +
       `(attempt ${upcomingAttempt})\n`
     )
-    setTimeout(() => this.connect(), delay)
+    // Record the timer handle so the watchdog can detect it being dropped.
+    this.pendingReconnectTimer = setTimeout(() => {
+      this.pendingReconnectTimer = null
+      this.connect()
+    }, delay)
     this.attemptIdx += 1
   }
 
