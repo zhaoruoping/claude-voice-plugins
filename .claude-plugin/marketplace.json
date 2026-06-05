@@ -30,6 +30,12 @@
       "description": "Bridge between an HTML page's embedded chat box and a Claude Code slice \u2014 chat-edit a web page live (sibling of slice-channel). Per general/html_channel_dev/DESIGN.md.",
       "source": "./plugins/html-channel",
       "category": "messaging"
+    },
+    {
+      "name": "channel-client",
+      "description": "UNIFIED thin MCP client for channel-msg-broker \u2014 single Unix-socket conn carrying BOTH Telegram and HTML-channel tool surfaces over LINE-JSON to /tmp/channel-msg-broker.sock. Primary tool send_message(channel, target, content, files?, ...) + back-compat wrappers reply / html_reply. Specialized TG: react / voice_reply / download_attachment / edit_message / send_typing. HTML-namespaced subscription-admin: html_bind / html_unbind / html_list_pages / html_self / channel_self. No grammy, no upstream polling, no proxy.",
+      "source": "./plugins/channel-client",
+      "category": "messaging"
     }
   ]
 }

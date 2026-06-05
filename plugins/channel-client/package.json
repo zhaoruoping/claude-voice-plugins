@@ -1,0 +1,13 @@
+{
+  "name": "channel-client",
+  "version": "0.2.3",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
