@@ -1,6 +1,23 @@
 #!/usr/bin/env bun
 /**
- * channel-client v0.2.6 — UNIFIED thin MCP client to the central channel-msg-broker.
+ * channel-client v0.2.7 — UNIFIED thin MCP client to the central channel-msg-broker.
+ * v0.2.7 (2026-06-09): active ping/pong liveness probe (Bug #19 phase 2).
+ * The v0.2.6 watchdog rescues a stuck reconnect TIMER, but it does NOT detect a
+ * conn that is socket-OPEN-but-functionally-DEAD (broker partially wedged: TCP
+ * still accepts our writes silently, no FIN/RST, no incoming heartbeats but
+ * also no timer fire because broker heartbeat loop wedged). The 120s socket
+ * idle timeout would eventually catch that, but 2 min is too slow for the
+ * bot↔user-facing UX (msg silent-drops during the window).
+ *
+ * v0.2.7 adds: every PING_INTERVAL_MS (30s) while connected, send {cmd:'ping'}
+ * via sendRaw — broker has _default_on_ping which echoes ok back. sendRaw's
+ * built-in PENDING_RESPONSE_TIMEOUT_MS (10s) bounds the wait. On
+ * pong-not-received (sendRaw returns {ok:false, error:'broker response timeout'}
+ * OR transport error), log + force socket destroy + scheduleReconnect — same
+ * recovery path the watchdog uses. Combined with broker-side phase-1 flapping
+ * protection, this closes the 'broker-wedge → bot silent offline 53 min' loop
+ * (2026-06-09 Nova anchor).
+ *
  * v0.2.6 (2026-06-06): reconnect watchdog backstop. After 2026-06-05 broker
  * restart left Probe/Patrick/Alice/Oscar with bun processes alive but socket-
  * stuck (setTimeout-based reconnect ladder fired once, the subsequent timer
@@ -157,7 +174,7 @@ for (const v of ['HTML_CHANNEL_PORT', 'HTML_CHANNEL_PAGE_FILE', 'HTML_CHANNEL_WI
 }
 
 process.stderr.write(
-  `channel-client v0.2.5: broker_sock=${BROKER_SOCK} bot_username=${BOT_USERNAME} ` +
+  `channel-client v0.2.7: broker_sock=${BROKER_SOCK} bot_username=${BOT_USERNAME} ` +
   `conn_id=${CONN_ID.slice(0, 8)}... label=${CLIENT_LABEL} ` +
   `session_id=${SESSION_ID ? SESSION_ID.slice(0, 8) + '...' : '<none>'}\n`
 )
@@ -176,6 +193,13 @@ const PENDING_RESPONSE_TIMEOUT_MS = 10000
 // emits at least platform_status heartbeats roughly every 30 s; this is set
 // conservatively (well above the heartbeat cadence) so it doesn't false-trip.
 const SOCKET_IDLE_TIMEOUT_MS = 120000
+// Active liveness probe (v0.2.7, Bug #19 phase 2, 2026-06-09). While
+// connected, send {cmd:'ping'} every PING_INTERVAL_MS; on
+// no-response-within-PENDING_RESPONSE_TIMEOUT_MS the conn is treated as dead
+// and reconnect is triggered. Catches broker-wedge scenarios where the socket
+// stays OPEN but the broker process can no longer service requests (closes
+// the 'broker partially wedged → bot silent for 2 min' UX gap).
+const PING_INTERVAL_MS = 30000
 
 type Resolver = (v: any) => void
 
@@ -217,6 +241,8 @@ class BrokerClient {
   private pendingReconnectTimer: ReturnType<typeof setTimeout> | null = null
   private nextReconnectAt = 0  // Date.now() of the next scheduled attempt
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
+  // Active ping/pong liveness probe (v0.2.7, Bug #19 phase 2).
+  private pingTimer: ReturnType<typeof setInterval> | null = null
 
   // HTML-plane state — pages currently bound (replayed on reconnect).
   pages = new Set<string>()
@@ -238,7 +264,59 @@ class BrokerClient {
         (this.watchdogTimer as any).unref()
       }
     }
+    // Active ping/pong (v0.2.7, Bug #19 phase 2). Detects broker-wedge
+    // (socket-OPEN but functionally DEAD) within ~PING_INTERVAL_MS +
+    // PENDING_RESPONSE_TIMEOUT_MS = 40s rather than the 120s socket-idle.
+    if (this.pingTimer == null) {
+      this.pingTimer = setInterval(() => this.pingTick(), PING_INTERVAL_MS)
+      if (this.pingTimer && typeof (this.pingTimer as any).unref === 'function') {
+        (this.pingTimer as any).unref()
+      }
+    }
     this.connect()
+  }
+
+  // Active liveness probe (v0.2.7, Bug #19 phase 2, 2026-06-09).
+  // Sends cmd:ping while connected; on no pong within sendRaw's built-in
+  // PENDING_RESPONSE_TIMEOUT_MS (10s), force socket destroy + reconnect.
+  // The 'broker disconnected' path also returns ok:false synchronously — we
+  // treat that as already-handled by the existing reconnect machinery and
+  // simply skip (no double-schedule).
+  private async pingTick(): Promise<void> {
+    // Healthy path: skip if not connected (reconnect machinery is in charge).
+    if (!this.connected || !this.socket || this.socket.destroyed) return
+    const sentSocket = this.socket
+    let resp: any
+    try {
+      resp = await this.sendRaw({ cmd: 'ping' })
+    } catch (err) {
+      // sendRaw never throws in practice (resolves with ok:false on error),
+      // but be defensive.
+      process.stderr.write(
+        `[channel-client] PING: sendRaw threw: ${err} — forcing reconnect\n`
+      )
+      if (this.socket === sentSocket && !sentSocket.destroyed) {
+        try { sentSocket.destroy() } catch {}
+      }
+      this.scheduleReconnect('ping send threw')
+      return
+    }
+    if (resp && resp.ok === true) {
+      // Healthy. Heartbeat received — implicit liveness verified.
+      return
+    }
+    // ok:false. If we already lost the socket between send and resp the
+    // reconnect machinery already fired — skip.
+    if (!this.connected || this.socket !== sentSocket || sentSocket.destroyed) {
+      return
+    }
+    const err = (resp && resp.error) || 'unknown'
+    process.stderr.write(
+      `[channel-client] PING: no pong (resp.error=${err}) — broker may be wedged; ` +
+      `forcing destroy + reconnect\n`
+    )
+    try { sentSocket.destroy() } catch {}
+    this.scheduleReconnect(`ping no-pong: ${err}`)
   }
 
   private watchdogTick(): void {
@@ -1625,6 +1703,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // ── Cleanup ─────────────────────────────────────────────────────────────
 function cleanup(): void {
   try {
+    // Stop timers FIRST so they can't fire after shutdown emits stderr.
+    if ((broker as any).pingTimer) {
+      try { clearInterval((broker as any).pingTimer) } catch {}
+      ;(broker as any).pingTimer = null
+    }
+    if ((broker as any).watchdogTimer) {
+      try { clearInterval((broker as any).watchdogTimer) } catch {}
+      ;(broker as any).watchdogTimer = null
+    }
     if (broker.socket && !broker.socket.destroyed) {
       // best-effort unbind for each bound page, then destroy.
       for (const page of [...broker.pages]) {
@@ -1636,7 +1723,7 @@ function cleanup(): void {
       broker.socket.destroy()
     }
   } catch {}
-  process.stderr.write('channel-client v0.2.0: shutting down\n')
+  process.stderr.write('channel-client v0.2.7: shutting down\n')
 }
 
 process.on('SIGINT', () => { cleanup(); process.exit(0) })
@@ -1661,6 +1748,6 @@ if (!IDLE_MODE) {
 }
 await mcp.connect(new StdioServerTransport())
 process.stderr.write(
-  `channel-client v0.2.5: MCP server connected (conn=${CONN_ID.slice(0, 8)}... bot=${BOT_USERNAME || '<idle>'}` +
+  `channel-client v0.2.7: MCP server connected (conn=${CONN_ID.slice(0, 8)}... bot=${BOT_USERNAME || '<idle>'}` +
   `${IDLE_MODE ? ' IDLE_MODE=1' : ''}${SESSION_ID ? ' slice=on' : ''})\n`
 )
