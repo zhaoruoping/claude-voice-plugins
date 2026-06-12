@@ -1200,8 +1200,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: { type: 'string', description: 'TG-only: message_id to thread under.' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: 'TG-only: rendering mode. Default "text".',
+            enum: ['text', 'markdownv2', 'rich'],
+            description:
+              'TG-only: rendering mode. "rich" = standard markdown parsed server-side by Telegram ' +
+              '(headings/tables/code/math/footnotes, no escaping needed, 32k chars) — PREFER for structured content. ' +
+              'Default "text".',
           },
           silent: { type: 'boolean', description: 'TG-only: disable_notification.' },
           link_preview: {
@@ -1249,11 +1252,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'with files); "sent (id: N)" with a single id means text-only (no file attached, retry with `files` ' +
         'parameter if a file was intended).\n\n' +
         'FORMATTING POLICY — when the reply contains structured content (tables, multi-column comparisons, key ' +
-        'results, lists with hierarchy, file paths / code snippets), PREFER format="markdownv2". MarkdownV2 syntax: ' +
-        '*bold* / _italic_ / __underline__ / ~strikethrough~ / `inline code` / ```code block``` / [link](url) / ' +
-        '>quote / ||spoiler||. Critical escape rule: chars _ * [ ] ( ) ~ ` > # + - = | { } . ! must be ' +
-        'backslash-escaped OUTSIDE code blocks. INSIDE code blocks no escaping needed — so numeric tables belong ' +
-        'in ```code blocks```. Default: "text" (plain, no escaping required).',
+        'results, lists with hierarchy, code, formulas), PREFER format="rich": write STANDARD markdown (NO escaping ' +
+        'needed) and Telegram parses it server-side into native rich blocks. Rich supports: # headings / **bold** / ' +
+        '*italic* / ~~strikethrough~~ / `code` / ```fenced code blocks``` / | md tables | (native rendering!) / ' +
+        '$inline math$ and $$display math$$ (LaTeX) / - lists / - [ ] task lists / >quotes / [^1] footnotes / ' +
+        '<details><summary>..</summary>..</details> collapsible blocks / <sup> <sub>. Limits: 32768 chars, 20 table ' +
+        'columns. If rich fails the broker auto-degrades to plain text with a "[rich-message send failed ...]" suffix.\n\n' +
+        'format="markdownv2" is the LEGACY mode (requires backslash-escaping _ * [ ] ( ) ~ ` > # + - = | { } . ! ' +
+        'outside code blocks) — only use when rich is unavailable. Default: "text" (plain, no escaping required).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1270,8 +1276,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: 'Rendering mode. PREFER "markdownv2" for structured content. Default: "text".',
+            enum: ['text', 'markdownv2', 'rich'],
+            description:
+              'Rendering mode. PREFER "rich" for structured content (standard markdown, server-side parsed, ' +
+              'no escaping). "markdownv2" is legacy. Default: "text".',
           },
           silent: {
             type: 'boolean',
@@ -1368,7 +1376,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: 'string',
             enum: ['text', 'markdownv2'],
-            description: 'Rendering mode (same rules as reply). Default: "text".',
+            description:
+              'Rendering mode. NOTE: "rich" is NOT supported for edits (TG editMessageText limitation) — ' +
+              'text/markdownv2 only. Default: "text".',
           },
         },
         required: ['chat_id', 'message_id', 'text'],
