@@ -188,6 +188,22 @@ const RECONNECT_BACKOFF_GENTLE_FACTOR = 1.5
 const RECONNECT_BACKOFF_CAP_MS = 30000
 // Per-call safety: 10 s timeout on every pending command (DESIGN §4.1).
 const PENDING_RESPONSE_TIMEOUT_MS = 10000
+// Outbound-send pending timeout (2026-06-16, mirror of broker dispatch + Bug #24).
+// A flat 10s pending timeout fires while an outbound send is STILL in flight on
+// a flapping proxy / large file upload → bot sees 'broker response timeout' and
+// resends a message that was actually delivered → DUPLICATE. Match the broker
+// budget: file send 120s, voice/download 120s, text send 60s. ping/register/
+// react/typing/etc keep the fast 10s — so dead-peer ping detection is unchanged.
+const SEND_PENDING_TIMEOUT_TEXT_MS = 60000
+const SEND_PENDING_TIMEOUT_MEDIA_MS = 120000
+function pendingTimeoutForCmd(obj: any): number {
+  const cmd = String(obj?.cmd ?? '')
+  const hasFiles = Array.isArray(obj?.files) && obj.files.length > 0
+  if ((cmd === 'send' || cmd === 'publish') && hasFiles) return SEND_PENDING_TIMEOUT_MEDIA_MS
+  if (cmd === 'voice_reply' || cmd === 'download_attachment') return SEND_PENDING_TIMEOUT_MEDIA_MS
+  if (cmd === 'send' || cmd === 'publish' || cmd === 'slice_send') return SEND_PENDING_TIMEOUT_TEXT_MS
+  return PENDING_RESPONSE_TIMEOUT_MS
+}
 // Dead-peer detection: if no data is received from broker within this window,
 // assume the broker died silently (no FIN/RST) and force-reconnect. The broker
 // emits at least platform_status heartbeats roughly every 30 s; this is set
@@ -804,6 +820,7 @@ class BrokerClient {
     if (!this.socket || !this.connected) {
       return Promise.resolve({ ok: false, error: 'broker disconnected' })
     }
+    const timeoutMs = pendingTimeoutForCmd(obj)
     return new Promise<any>((resolve) => {
       this.pending.push(resolve)
       try {
@@ -819,7 +836,7 @@ class BrokerClient {
           this.pending.splice(idx, 1)
           resolve({ ok: false, error: 'broker response timeout' })
         }
-      }, PENDING_RESPONSE_TIMEOUT_MS)
+      }, timeoutMs)
     })
   }
 
