@@ -973,6 +973,20 @@ class BrokerClient {
   async sliceSelf(): Promise<any> {
     return this.sendRaw({ cmd: 'slice_self' })
   }
+
+  // ── Outbound wire helper — BOT-TO-BOT plane (v0.2.10) ────────────────────
+  // Separate cmd from slice_send on purpose: a slice is your own forked
+  // child, a peer bot is an independent agent. The broker resolves `bot`
+  // (name / @username / label / unique task / session_id) against its LIVE
+  // conn table, so callers never hand-resolve a session_id — which is what
+  // made silent wrong-recipient delivery possible (2026-07-26 incident).
+  async botSend(bot: string, content: string): Promise<any> {
+    return this.sendRaw({
+      cmd: 'bot_send',
+      bot,
+      content,
+    })
+  }
 }
 
 const broker = new BrokerClient()
@@ -1487,9 +1501,46 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Return this conn\'s slice state: session_id (or "<none>" if not exporting SLICE_SESSION_ID), ' +
         'bot_username, and the broker-wide list of active slice peers ' +
-        '({session_id, bot_username, client_label, conn_id}). Use to discover what session_ids are ' +
-        'currently reachable via slice_send.',
+        '({session_id, bot_username, client_label, conn_id}). Use to discover which bots are ' +
+        'currently reachable (the reachability test for bot_send / slice_send).',
       inputSchema: { type: 'object', properties: {} },
+    },
+
+    // ── BOT-TO-BOT (v0.2.10; peer messaging, addressed by NAME) ──────────
+    {
+      name: 'bot_send',
+      description:
+        'Message a PEER BOT — the dedicated bot-to-bot tool. ADDRESS IT BY NAME: pass the bot\'s ' +
+        'name ("Larry", "Iris"), @username, task label, or unique current_task. The BROKER resolves ' +
+        'it against its live connection table, so you never look up a session_id.\n\n' +
+        '🔴 NEVER hand-resolve a session_id and never copy one out of another bot\'s message or a ' +
+        'cached roster: session_ids change on every restart, and a stale-but-live UUID delivers ' +
+        'SILENTLY TO THE WRONG BOT while still returning ok (2026-07-26: two messages addressed to ' +
+        'Tom landed in Theo\'s session, and Tom\'s silence was misread as "Tom did not reply"). ' +
+        'Passing the name makes that impossible.\n\n' +
+        'Errors are distinct and mean different things: unknown_target (name not known — check ' +
+        'slice_self), offline_target (right bot, but it has NO live connection — it is down or ' +
+        'restarting, so use the Telegram group fallback), unknown_session (you passed a stale ' +
+        'UUID — pass the name instead), ambiguous_target (refused rather than guessed).\n\n' +
+        'Reaches only bots with a live broker connection; nothing is buffered for an offline peer. ' +
+        'Etiquette (see the /bot-to-bot skill): identify yourself with your own @username and end ' +
+        'with [reply: yes|no] to prevent loops. Use slice_send instead for your OWN forked slices.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          bot: {
+            type: 'string',
+            description:
+              'Recipient bot: name ("Larry"), @username ("@ucas_iris_bot"), task label, or unique ' +
+              'current_task. An exact session_id also works but is NOT recommended — it goes stale.',
+          },
+          content: {
+            type: 'string',
+            description: 'Message body (parameter is `content`, NOT `text`).',
+          },
+        },
+        required: ['bot', 'content'],
+      },
     },
   ],
 }))
@@ -1698,6 +1749,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         content: [{
           type: 'text',
           text: `slice_send → ${target_session_id.slice(0, 12)}... ok (content_len=${content.length})`,
+        }],
+      }
+    }
+
+    // ── BOT-TO-BOT: bot_send (v0.2.10) ─────────────────────────────────
+    if (name === 'bot_send') {
+      const bot = String(args.bot ?? args.target_session_id ?? '').trim()
+      if (!bot) throw new Error('bot_send: bot required — pass a bot name, @username, label, or session_id')
+      const content = String(args.content ?? '')
+      if (!content) throw new Error('bot_send: content required')
+      const r = await broker.botSend(bot, content)
+      if (!r?.ok) {
+        // Surface the broker's error class verbatim — unknown_target /
+        // offline_target / unknown_session / ambiguous_target each call for
+        // a different fix, so collapsing them would undo the point.
+        throw new Error(`bot_send: broker error: ${r?.error || 'unknown'}`)
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `bot_send → ${bot} ok (content_len=${content.length})`,
         }],
       }
     }
