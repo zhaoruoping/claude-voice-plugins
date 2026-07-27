@@ -86,8 +86,30 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import * as net from 'net'
+import * as fs from 'fs'
+import * as path from 'path'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
+
+// ── Plugin version — SINGLE SOURCE OF TRUTH ─────────────────────────────
+// Read from the manifest at load time. This used to be a literal repeated at
+// three call sites, and it drifted: the tools kept reporting '0.2.5' while the
+// plugin shipped 0.2.10, so any bot asking "what version am I on" got a wrong
+// answer from the component's own self-report. A self-description that can
+// silently misstate itself is the same defect class as a check that passes
+// without looking — so it is derived here, never typed twice.
+const PLUGIN_VERSION: string = (() => {
+  for (const rel of ['.claude-plugin/plugin.json', 'package.json']) {
+    try {
+      const raw = fs.readFileSync(path.join(import.meta.dir, rel), 'utf8')
+      const v = JSON.parse(raw)?.version
+      if (typeof v === 'string' && v) return v
+    } catch { /* try next candidate */ }
+  }
+  // Explicitly NOT a version-looking placeholder: a wrong-but-plausible
+  // version is worse than an obviously-unknown one.
+  return 'unknown'
+})()
 
 // ── Configuration ───────────────────────────────────────────────────────
 // Broker socket resolution (DESIGN.md §4.1; HTML legacy env vars kept as fallback
@@ -260,6 +282,17 @@ class BrokerClient {
   // Active ping/pong liveness probe (v0.2.7, Bug #19 phase 2).
   private pingTimer: ReturnType<typeof setInterval> | null = null
 
+  // ── Reachability evidence (v0.2.11) ────────────────────────────────────
+  // `connected` alone only means "my socket is open", which is NOT the same
+  // as "messages reach me": during the 2026-07-26 double-broker incident
+  // every bot had connected===true while attached to an ORPHANED broker that
+  // no longer owned the fleet. A pong is stronger evidence (some broker
+  // answered on THIS socket just now), so record when one last arrived and
+  // let channel_self publish the derived verdict instead of making each
+  // caller re-derive it from raw fields.
+  lastPongAt = 0        // Date.now() of the last ok pong; 0 = never
+  lastConnectedAt = 0   // Date.now() of the last successful connect
+
   // HTML-plane state — pages currently bound (replayed on reconnect).
   pages = new Set<string>()
   activePage: string | null = null
@@ -319,6 +352,7 @@ class BrokerClient {
     }
     if (resp && resp.ok === true) {
       // Healthy. Heartbeat received — implicit liveness verified.
+      this.lastPongAt = Date.now()
       return
     }
     // ok:false. If we already lost the socket between send and resp the
@@ -386,6 +420,7 @@ class BrokerClient {
     s.setTimeout(SOCKET_IDLE_TIMEOUT_MS)
     s.on('connect', () => {
       this.connected = true
+      this.lastConnectedAt = Date.now()
       this.attemptIdx = 0
       process.stderr.write(
         `channel-client: broker connected; registering as bot ` +
@@ -991,6 +1026,57 @@ class BrokerClient {
 
 const broker = new BrokerClient()
 
+// ── Derived reachability verdict (v0.2.11) ──────────────────────────────
+// Answers the question callers actually ask ("can messages reach me?")
+// instead of leaving them to infer it from `broker_connected`, which only
+// says the socket is open. Every field is evidence this process genuinely
+// holds — nothing here is guessed.
+//
+// `cannot_establish` is deliberate and is the point of the whole report: a
+// pong proves SOME broker answered on this socket, NOT that the broker which
+// polls this bot's Telegram token is the one routing to it. On 2026-07-26 a
+// superseded broker kept every bot's socket open (connected===true, pongs
+// answered) while a second broker owned the fleet — so a verdict that omits
+// this limit would be true and still misleading.
+function reachabilityReport(): Record<string, unknown> {
+  const now = Date.now()
+  const pongAge = broker.lastPongAt ? Math.round((now - broker.lastPongAt) / 1000) : null
+  const connAge = broker.lastConnectedAt ? Math.round((now - broker.lastConnectedAt) / 1000) : null
+  const pingWindow = Math.round((PING_INTERVAL_MS * 3) / 1000)  // ~90s: 3 missed pings
+
+  let verdict: string
+  let basis: string
+  if (!broker.connected) {
+    verdict = 'no'
+    basis = `socket is not connected (consecutive failed connects: ${broker.attemptIdx})`
+  } else if (pongAge === null) {
+    verdict = connAge !== null && connAge < pingWindow ? 'probably' : 'unknown'
+    basis = `socket open ${connAge ?? '?'}s, but no pong observed yet ` +
+            `(the first ping runs ${Math.round(PING_INTERVAL_MS / 1000)}s after connect)`
+  } else if (pongAge <= pingWindow) {
+    verdict = 'yes'
+    basis = `a broker answered a ping ${pongAge}s ago on this socket`
+  } else {
+    verdict = 'stale'
+    basis = `last pong was ${pongAge}s ago (> ${pingWindow}s); the socket looks ` +
+            `open but the peer may be wedged`
+  }
+
+  return {
+    verdict,                       // yes | probably | stale | unknown | no
+    basis,
+    socket_open: broker.connected,
+    last_pong_age_s: pongAge,
+    connected_for_s: connAge,
+    cannot_establish:
+      'Whether the broker on the other end is the one that currently owns ' +
+      'this bot\'s Telegram token. A superseded/orphaned broker keeps sockets ' +
+      'open and answers pings while a different broker serves the fleet ' +
+      '(2026-07-26). To confirm end-to-end delivery, ask the broker side ' +
+      '(channel_broker_cli list-bots) or send a real message.',
+  }
+}
+
 // ── Tool-argument coercion helpers ─────────────────────────────────────
 // chat_id / message_id arrive as strings from the rendered <channel> tag
 // (DESIGN §4.1 STRING-CAST contract); coerce back to TG integers for the wire.
@@ -1173,7 +1259,7 @@ const INSTRUCTIONS = [
 ].join('\n')
 
 const mcp = new Server(
-  { name: 'channel-client', version: '0.2.5' },
+  { name: 'channel-client', version: PLUGIN_VERSION },
   {
     capabilities: {
       tools: {},
@@ -1573,16 +1659,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           type: 'text',
           text: JSON.stringify({
             plugin: 'channel-client',
-            version: '0.2.5',
+            version: PLUGIN_VERSION,
             conn_id: CONN_ID,
             bot_username: BOT_USERNAME,
             client_label: CLIENT_LABEL,
             broker_socket: BROKER_SOCK,
+            // RAW field, kept for back-compat. Means ONLY "my socket is
+            // open" — see `reachability` below for the answer to the
+            // question callers actually ask.
             broker_connected: broker.connected,
             attempt_idx: broker.attemptIdx,
             active_page_id: broker.activePage,
             all_pages_bound: [...broker.pages],
             session_id: SESSION_ID || '<unset>',
+            // DERIVED verdict + its basis + its limits. Published here on
+            // purpose: this component holds the evidence, so it should state
+            // the conclusion rather than emit ingredients and let every
+            // caller re-derive it (several derived it wrong — a socket being
+            // open was read as "messages reach me").
+            reachability: reachabilityReport(),
           }, null, 2),
         }],
       }
@@ -1599,9 +1694,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             bot_username: BOT_USERNAME,
             platform: 'html',
             broker_socket: BROKER_SOCK,
-            broker_connected: broker.connected,
+            broker_connected: broker.connected,   // raw: socket open only
             active_page_id: broker.activePage,
             all_pages_bound: [...broker.pages],
+            reachability: reachabilityReport(),
           }, null, 2),
         }],
       }
@@ -1783,7 +1879,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const ps = (r.platform_status && typeof r.platform_status === 'object') ? r.platform_status : {}
       const payload = {
         plugin: 'channel-client',
-        version: '0.2.5',
+        version: PLUGIN_VERSION,
         bot_username: r.bot_username || '',
         session_id: ps.session_id || SESSION_ID || '',
         own_session_id_env: SESSION_ID || '<unset>',
