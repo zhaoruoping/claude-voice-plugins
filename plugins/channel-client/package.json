@@ -1,6 +1,6 @@
 {
   "name": "channel-client",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",

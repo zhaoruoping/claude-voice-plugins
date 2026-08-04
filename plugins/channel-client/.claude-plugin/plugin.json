@@ -1,7 +1,7 @@
 {
   "name": "channel-client",
   "description": "Unified thin MCP client to channel-msg-broker \u2014 TG + HTML + slice (+ future weixin/feishu) on one Unix socket. Replaces channel-tg-client + channel-html-client + slice-channel (for routing=broker bots). ONE conn / ONE register (platform-less) / ONE MCP server carries ALL planes: TG (reply / react / voice_reply / edit_message / download_attachment / send_typing), HTML-channel (html_bind / html_unbind / html_reply / html_list_pages / html_self), SLICE (slice_send / slice_self). Primary unified tool send_message({channel,target,content,...}) discriminates by channel arg; legacy tool names preserved as compat wrappers for existing bot prompts. Slice plane added v0.2.5 (2026-06-05).",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "keywords": [
     "channel",
     "broker",

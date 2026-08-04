@@ -442,7 +442,11 @@ class BrokerClient {
         bot_username: BOT_USERNAME,
         conn_id: CONN_ID,
         client_label: CLIENT_LABEL,
-        capabilities: ['files', 'voice', 'typing', 'mentions', 'permission', 'pubsub', 'slice'],
+        capabilities: ['files', 'voice', 'typing', 'mentions', 'permission', 'pubsub', 'slice', 'weixin'],
+        // 'weixin' (v0.2.14) is load-bearing, not decoration: an older plugin
+        // receiving platform="weixin" drops it in its unknown-platform branch,
+        // so the broker logs a successful delivery for a message the bot never
+        // sees. Declaring the capability lets the broker say so instead.
       }
       if (SESSION_ID) registerFrame.session_id = SESSION_ID
       this.sendRaw(registerFrame)
