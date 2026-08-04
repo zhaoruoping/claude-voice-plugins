@@ -1078,12 +1078,14 @@ class BrokerClient {
   // format / reply_to, and a reply is only possible while a context_token
   // from that peer's last message is still live. Folding it into cmd:send
   // would mean a validator that lies about both planes.
-  async weixinSend(peer_id: string, content: string): Promise<any> {
-    return this.sendRaw({
-      cmd: 'weixin_send',
-      peer_id,
-      content,
-    })
+  async weixinSend(peer_id: string, content: string, files?: string[]): Promise<any> {
+    const wire: any = { cmd: 'weixin_send', peer_id, content }
+    if (files && files.length) wire.files = files
+    return this.sendRaw(wire)
+  }
+
+  async weixinTyping(peer_id: string): Promise<any> {
+    return this.sendRaw({ cmd: 'weixin_typing', peer_id })
   }
 
   async weixinSelf(): Promise<any> {
@@ -1207,13 +1209,20 @@ async function dispatchSendMessage(a: SendMessageArgs): Promise<{ summary: strin
     if (peerRaw === undefined || peerRaw === null || peerRaw === '') {
       throw new Error('send_message(weixin): target.peer_id required (the peer_id from the inbound message)')
     }
-    if (!content) throw new Error('send_message(weixin): content required')
-    if (a.files && a.files.length) {
-      throw new Error('send_message(weixin): file attachments are not supported on the WeChat plane yet')
+    const wxFiles = Array.isArray(a.files) ? a.files.map(f => String(f)) : undefined
+    if (!content && !(wxFiles && wxFiles.length)) {
+      throw new Error('send_message(weixin): content or files required')
     }
-    const r = await broker.weixinSend(String(peerRaw), content)
+    const r = await broker.weixinSend(String(peerRaw), content, wxFiles)
     if (!r?.ok) throw new Error(`send_message(weixin): broker error: ${r?.error || 'unknown'}`)
-    return { summary: `sent (weixin id: ${r.weixin_message_id ?? '?'})`, raw: r }
+    // A multi-file send where SOME files failed must not read as clean success.
+    const partial: string[] = r?.weixin?.partial_errors ?? []
+    const nParts = r?.weixin?.sent_parts?.length ?? 0
+    let summary = nParts > 1
+      ? `sent ${nParts} parts (weixin id: ${r.weixin_message_id ?? '?'})`
+      : `sent (weixin id: ${r.weixin_message_id ?? '?'})`
+    if (partial.length) summary += ` — PARTIAL, these did NOT send: ${partial.join('; ')}`
+    return { summary, raw: r }
   }
 
   if (channel === 'tg') {
@@ -1314,7 +1323,9 @@ const INSTRUCTIONS = [
   'Three hard limits, so you do not promise what the channel cannot do:',
   '  * You can only REPLY, never INITIATE (a send needs a token that arrives with their',
   '    message and rotates ~24h). Scheduled/proactive WeChat messages are impossible.',
-  '  * Plain text only — no files, no rich formatting, no reply-threading.',
+  '  * Markdown is degraded to plain text by the broker (WeChat renders none) — write normally.',
+  '  * Files ARE supported: weixin_reply(peer_id, text, files=[abs paths]). WeChat allows ONE',
+  '    item per message, so text + a file is sent as two messages, never a caption.',
   '  * The WeChat session can expire and needs the operator to re-scan a QR; when that',
   '    happens your replies fail. weixin_self() reports it.',
   '',
@@ -1751,9 +1762,28 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           peer_id: { type: 'string', description: 'WeChat peer id from the inbound message meta.' },
-          text: { type: 'string', description: 'Message body (plain text).' },
+          text: { type: 'string', description: 'Message body. Markdown is DEGRADED to plain text by the broker (WeChat renders none), so write normally — bold/lists/links will not arrive as literal punctuation.' },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Absolute paths to send. Images (.jpg/.png/.gif/.bmp/.webp/.heic) go as photos, videos (.mp4/.mov/.avi/.mkv/.webm) as video, everything else as a file. WeChat allows ONE item per message, so text + a file is two messages, not a caption. A partial failure is reported as PARTIAL — do not read it as success.',
+          },
         },
-        required: ['peer_id', 'text'],
+        required: ['peer_id'],
+      },
+    },
+    {
+      name: 'weixin_typing',
+      description:
+        'Show a typing indicator to a WeChat peer. BEST-EFFORT: a failure here means nothing ' +
+        'about whether your message will send, and success does not guarantee the peer saw it. ' +
+        'Never treat it as delivery.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          peer_id: { type: 'string', description: 'WeChat peer id from the inbound message meta.' },
+        },
+        required: ['peer_id'],
       },
     },
     {
@@ -2031,13 +2061,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const peer_id = String(args.peer_id ?? '').trim()
       if (!peer_id) throw new Error('weixin_reply: peer_id required (copy it from the inbound message meta)')
       const text = String(args.text ?? args.content ?? '')
-      if (!text) throw new Error('weixin_reply: text required')
+      const files = Array.isArray(args.files) ? (args.files as unknown[]).map(f => String(f)) : undefined
+      if (!text && !(files && files.length)) {
+        throw new Error('weixin_reply: text or files required')
+      }
       const { summary } = await dispatchSendMessage({
         channel: 'weixin',
         target: { peer_id },
         content: text,
+        files,
       })
       return { content: [{ type: 'text', text: summary }] }
+    }
+
+    if (name === 'weixin_typing') {
+      const peer_id = String(args.peer_id ?? '').trim()
+      if (!peer_id) throw new Error('weixin_typing: peer_id required')
+      const r = await broker.weixinTyping(peer_id)
+      if (!r?.ok) throw new Error(`weixin_typing: broker error: ${r?.error || 'unknown'}`)
+      return { content: [{ type: 'text', text: 'typing sent (best-effort)' }] }
     }
 
     if (name === 'weixin_self') {
