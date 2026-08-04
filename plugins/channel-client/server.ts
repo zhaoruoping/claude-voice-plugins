@@ -163,7 +163,7 @@ const SESSION_ID = (
 // We refuse to start if it's set so an operator notices the misconfiguration.
 if (process.env.TELEGRAM_BOT_TOKEN) {
   process.stderr.write(
-    `channel-client v0.2.0: FATAL TELEGRAM_BOT_TOKEN is set in this process's env — ` +
+    `channel-client v${PLUGIN_VERSION}: FATAL TELEGRAM_BOT_TOKEN is set in this process's env — ` +
     `the broker owns the upstream TG conn and the token must live ONLY in the broker process. ` +
     `Unset TELEGRAM_BOT_TOKEN in this bot's launcher env and restart. Exiting.\n`
   )
@@ -189,14 +189,14 @@ if (IDLE_MODE) {
 for (const v of ['HTML_CHANNEL_PORT', 'HTML_CHANNEL_PAGE_FILE', 'HTML_CHANNEL_WIDGET_DIR']) {
   if (process.env[v]) {
     process.stderr.write(
-      `channel-client v0.2.0: env ${v} is DEPRECATED — broker-side only ` +
+      `channel-client v${PLUGIN_VERSION}: env ${v} is DEPRECATED — broker-side only ` +
       `(no HTTP, no page binding). Use tools/html_chat_frontend.py to serve a page. Ignoring.\n`
     )
   }
 }
 
 process.stderr.write(
-  `channel-client v0.2.7: broker_sock=${BROKER_SOCK} bot_username=${BOT_USERNAME} ` +
+  `channel-client v${PLUGIN_VERSION}: broker_sock=${BROKER_SOCK} bot_username=${BOT_USERNAME} ` +
   `conn_id=${CONN_ID.slice(0, 8)}... label=${CLIENT_LABEL} ` +
   `session_id=${SESSION_ID ? SESSION_ID.slice(0, 8) + '...' : '<none>'}\n`
 )
@@ -1210,7 +1210,7 @@ async function dispatchSendMessage(a: SendMessageArgs): Promise<{ summary: strin
 
 // ── MCP server ──────────────────────────────────────────────────────────
 const INSTRUCTIONS = [
-  'channel-client v0.2.5 — UNIFIED thin MCP client to the central channel-msg-broker.',
+  `channel-client v${PLUGIN_VERSION} — UNIFIED thin MCP client to the central channel-msg-broker.`,
   'Bridges Telegram + HTML-page + Slice channels on a single Unix-socket connection.',
   'This plugin does NOT hold any bot_token, does NOT poll TG, does NOT bind any port —',
   'the broker owns the upstream connections, allowlist enforcement, file IO, STT/TTS,',
@@ -1918,7 +1918,7 @@ function cleanup(): void {
       broker.socket.destroy()
     }
   } catch {}
-  process.stderr.write('channel-client v0.2.7: shutting down\n')
+  process.stderr.write(`channel-client v${PLUGIN_VERSION}: shutting down\n`)
 }
 
 process.on('SIGINT', () => { cleanup(); process.exit(0) })
@@ -1943,6 +1943,6 @@ if (!IDLE_MODE) {
 }
 await mcp.connect(new StdioServerTransport())
 process.stderr.write(
-  `channel-client v0.2.7: MCP server connected (conn=${CONN_ID.slice(0, 8)}... bot=${BOT_USERNAME || '<idle>'}` +
+  `channel-client v${PLUGIN_VERSION}: MCP server connected (conn=${CONN_ID.slice(0, 8)}... bot=${BOT_USERNAME || '<idle>'}` +
   `${IDLE_MODE ? ' IDLE_MODE=1' : ''}${SESSION_ID ? ' slice=on' : ''})\n`
 )
