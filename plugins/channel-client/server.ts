@@ -1217,10 +1217,22 @@ async function dispatchSendMessage(a: SendMessageArgs): Promise<{ summary: strin
     if (!r?.ok) throw new Error(`send_message(weixin): broker error: ${r?.error || 'unknown'}`)
     // A multi-file send where SOME files failed must not read as clean success.
     const partial: string[] = r?.weixin?.partial_errors ?? []
-    const nParts = r?.weixin?.sent_parts?.length ?? 0
-    let summary = nParts > 1
-      ? `sent ${nParts} parts (weixin id: ${r.weixin_message_id ?? '?'})`
+    // sent_parts counts WeChat MESSAGES (text and each media are separate
+    // sends). Reported like the TG side's "sent N parts", because a caller
+    // that only sees one id cannot tell "text+file both went" from "only the
+    // text went" — reported from production 2026-08-06 after a file send came
+    // back as a bare `sent (weixin id: ...)`.
+    const parts: any[] = Array.isArray(r?.weixin?.sent_parts) ? r.weixin.sent_parts : []
+    let summary = parts.length
+      ? `sent ${parts.length} parts (${parts.map((p: any) => `${p?.kind ?? '?'}:${p?.message_id ?? '?'}`).join(', ')})`
       : `sent (weixin id: ${r.weixin_message_id ?? '?'})`
+    // Requested N attachments but fewer media messages came back ⇒ say so.
+    // Silence here is the failure mode this whole shape exists to remove.
+    const wantFiles = wxFiles?.length ?? 0
+    const gotMedia = parts.filter((p: any) => p?.kind && p.kind !== 'text').length
+    if (wantFiles && parts.length && gotMedia < wantFiles) {
+      summary += ` — ⚠️ ${wantFiles} file(s) requested but only ${gotMedia} media message(s) sent`
+    }
     if (partial.length) summary += ` — PARTIAL, these did NOT send: ${partial.join('; ')}`
     return { summary, raw: r }
   }
