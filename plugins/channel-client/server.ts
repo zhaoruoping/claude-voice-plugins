@@ -1064,12 +1064,15 @@ class BrokerClient {
   // (name / @username / label / unique task / session_id) against its LIVE
   // conn table, so callers never hand-resolve a session_id — which is what
   // made silent wrong-recipient delivery possible (2026-07-26 incident).
-  async botSend(bot: string, content: string): Promise<any> {
-    return this.sendRaw({
-      cmd: 'bot_send',
-      bot,
-      content,
-    })
+  // `deferred` (v0.2.17) queues instead of injecting: the broker holds the
+  // message until the target is ALREADY running a turn, so a low-value peer
+  // note rides a prompt-cache write somebody was going to pay for anyway
+  // instead of forcing a cold one. Omitted from the frame unless true, so
+  // the realtime path stays byte-identical on the wire.
+  async botSend(bot: string, content: string, deferred?: boolean): Promise<any> {
+    const frame: Record<string, unknown> = { cmd: 'bot_send', bot, content }
+    if (deferred) frame.deferred = true
+    return this.sendRaw(frame)
   }
 
   // ── Outbound wire helpers — WEIXIN plane (v0.2.13) ───────────────────────
@@ -1748,6 +1751,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Message body (parameter is `content`, NOT `text`).',
           },
+          deferred: {
+            type: 'boolean',
+            description:
+              'Default false (deliver now). Set true for a NON-URGENT note: the broker queues it ' +
+              'durably and hands it over the next time the target is already running a turn, so it ' +
+              'costs an incremental prompt-cache write instead of a cold one. Two consequences to ' +
+              'accept before using it: (1) it can wait — there is a forced-delivery deadline, but ' +
+              'until then arrival is not on your schedule, so never defer anything time-critical; ' +
+              '(2) the recipient sees how old it is, and will read it as a note written back then, ' +
+              'not as a live instruction. Deferred DOES reach an offline bot (realtime bot_send ' +
+              'fails with offline_target instead). The reply names the queue depth and the ' +
+              'deadline — it will not look like a normal send, on purpose.',
+          },
         },
         required: ['bot', 'content'],
       },
@@ -2034,12 +2050,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       if (!bot) throw new Error('bot_send: bot required — pass a bot name, @username, label, or session_id')
       const content = String(args.content ?? '')
       if (!content) throw new Error('bot_send: content required')
-      const r = await broker.botSend(bot, content)
+      const deferred = args.deferred === true
+      const r = await broker.botSend(bot, content, deferred)
       if (!r?.ok) {
         // Surface the broker's error class verbatim — unknown_target /
-        // offline_target / unknown_session / ambiguous_target each call for
-        // a different fix, so collapsing them would undo the point.
+        // offline_target / unknown_session / ambiguous_target / inbox_full
+        // each call for a different fix, so collapsing them would undo the
+        // point.
         throw new Error(`bot_send: broker error: ${r?.error || 'unknown'}`)
+      }
+      // A queued message and a delivered one MUST NOT read the same. The
+      // caller's next decision depends on which happened, and "ok" for both
+      // is precisely the false-success shape this plane keeps being bitten
+      // by — so say queued, say how deep, say when it is forced through.
+      if (r.deferred?.queued) {
+        const d = r.deferred
+        const hrs = d.max_age_seconds ? Math.round(d.max_age_seconds / 3600) : null
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `bot_send → ${d.target} QUEUED, not delivered (deferred). ` +
+              `#${d.queue_depth} in their inbox; arrives on ${d.delivers_on}` +
+              (hrs ? `; forced through after ${hrs}h` : '') +
+              `. They will see it stamped with its age.`,
+          }],
+        }
       }
       return {
         content: [{
