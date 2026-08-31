@@ -789,6 +789,13 @@ class BrokerClient {
       ts,
     }
     if (fromBot) meta.from_bot_username = fromBot
+    // Threading handles (v0.2.18). `mid` is the one that matters: quote it back as
+    // `reply_to` and the broker puts your answer in the same thread — nobody has to
+    // invent or remember a thread id.
+    if (payload.mid) meta.mid = String(payload.mid)
+    if (payload.thread_id) meta.thread_id = String(payload.thread_id)
+    if (payload.room) meta.room = String(payload.room)
+    if (payload.hops != null) meta.hops = String(payload.hops)
 
     process.stderr.write(
       `channel-client: slice inbound from=${fromSid.slice(0, 12) || '?'} ` +
@@ -1069,10 +1076,37 @@ class BrokerClient {
   // note rides a prompt-cache write somebody was going to pay for anyway
   // instead of forcing a cold one. Omitted from the frame unless true, so
   // the realtime path stays byte-identical on the wire.
-  async botSend(bot: string, content: string, deferred?: boolean): Promise<any> {
+  async botSend(
+    bot: string, content: string, deferred?: boolean,
+    reply_to?: string, thread_id?: string,
+  ): Promise<any> {
     const frame: Record<string, unknown> = { cmd: 'bot_send', bot, content }
     if (deferred) frame.deferred = true
+    // Threading (v0.2.18) is OPTIONAL on the wire: omitted unless asked for, so the
+    // realtime frame stays byte-identical for a broker that predates it.
+    if (reply_to) frame.reply_to = reply_to
+    if (thread_id) frame.thread_id = thread_id
     return this.sendRaw(frame)
+  }
+
+  // ── Collaboration plane (v0.2.18): rooms + threads + history read-back ───
+  async roomSend(room: string, content: string, reply_to?: string,
+                 thread_id?: string): Promise<any> {
+    const frame: Record<string, unknown> = { cmd: 'room_send', room, content }
+    if (reply_to) frame.reply_to = reply_to
+    if (thread_id) frame.thread_id = thread_id
+    return this.sendRaw(frame)
+  }
+
+  async roomCmd(cmd: string, room?: string, topic?: string): Promise<any> {
+    const frame: Record<string, unknown> = { cmd }
+    if (room) frame.room = room
+    if (topic) frame.topic = topic
+    return this.sendRaw(frame)
+  }
+
+  async peerHistory(opts: Record<string, unknown>): Promise<any> {
+    return this.sendRaw({ cmd: 'peer_history', ...opts })
   }
 
   // ── Outbound wire helpers — WEIXIN plane (v0.2.13) ───────────────────────
@@ -1709,6 +1743,69 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['target_session_id', 'content'],
       },
     },
+    // ── COLLABORATION PLANE (v0.2.18) ────────────────────────────────────
+    // What an N-way discussion needs and point-to-point cannot express.
+    {
+      name: 'room_send',
+      description:
+        'Send ONE message to every member of a room — the tool for a discussion among ' +
+        'three or more bots. Join the room first (tool `room`, action "join").\n\n' +
+        'Pass `reply_to` with the `mid` of the message you are answering and your reply ' +
+        'lands in the SAME thread automatically — you never allocate a thread id.\n\n' +
+        'The result names three OUTCOMES separately and they are not the same thing: ' +
+        'delivered (a live member got it), QUEUED (an offline member will get it on their ' +
+        'next broker activity) and FAILED. It also returns this message\'s `mid` so the ' +
+        'others can answer into the thread.\n\n' +
+        'Refusals worth knowing: `not_a_member` (join first), `rate_limited` (the room is ' +
+        'over its per-minute cap) and `hop_limit_exceeded` — the reply chain is too deep, ' +
+        'which means summarise or bring in a human rather than answer again.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room id, e.g. "research:x2370".' },
+          content: { type: 'string' },
+          reply_to: { type: 'string', description: 'mid of the message you are answering.' },
+          thread_id: { type: 'string', description: 'Rarely needed — reply_to sets it.' },
+        },
+        required: ['room', 'content'],
+      },
+    },
+    {
+      name: 'room',
+      description:
+        'Manage room membership: action "join" (also creates it), "leave", or "list". ' +
+        '`list` with no room returns the rooms you are in plus every room on the broker; ' +
+        'with a room it returns that room\'s members. You must be a member to send to a ' +
+        'room or to read its history.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['join', 'leave', 'list'] },
+          room: { type: 'string' },
+          topic: { type: 'string', description: 'What the room is for (join only).' },
+        },
+        required: ['action'],
+      },
+    },
+    {
+      name: 'peer_history',
+      description:
+        'Read a conversation BACK from the broker — the thing that makes a discussion ' +
+        'survive your restart. Without arguments it returns your recent messages; narrow ' +
+        'it with `room`, `peer` (a bot name), `thread_id`, or `since` (ISO timestamp).\n\n' +
+        'You only ever see conversations you took part in, and rooms you have joined. ' +
+        'That boundary is enforced by the broker, not by this tool.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string' },
+          peer: { type: 'string', description: 'The other bot in a 1:1 conversation.' },
+          thread_id: { type: 'string' },
+          since: { type: 'string', description: 'ISO timestamp lower bound.' },
+          limit: { type: 'number', description: 'Default 50, capped by the broker.' },
+        },
+      },
+    },
     {
       name: 'slice_self',
       description:
@@ -1750,6 +1847,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           content: {
             type: 'string',
             description: 'Message body (parameter is `content`, NOT `text`).',
+          },
+          reply_to: {
+            type: 'string',
+            description:
+              'The `mid` of the message you are answering. The broker inherits that ' +
+              'message\'s thread, so a thread forms without anyone allocating an id. ' +
+              'Chains that get too deep are refused (hop_limit_exceeded) — that is the ' +
+              'brake on two bots answering each other forever.',
+          },
+          thread_id: {
+            type: 'string',
+            description: 'Rarely needed — reply_to sets the thread for you.',
           },
           deferred: {
             type: 'boolean',
@@ -2051,7 +2160,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const content = String(args.content ?? '')
       if (!content) throw new Error('bot_send: content required')
       const deferred = args.deferred === true
-      const r = await broker.botSend(bot, content, deferred)
+      const r = await broker.botSend(
+        bot, content, deferred,
+        args.reply_to ? String(args.reply_to) : undefined,
+        args.thread_id ? String(args.thread_id) : undefined,
+      )
       if (!r?.ok) {
         // Surface the broker's error class verbatim — unknown_target /
         // offline_target / unknown_session / ambiguous_target / inbox_full
@@ -2077,10 +2190,77 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }],
         }
       }
+      const col = r.collab || {}
       return {
         content: [{
           type: 'text',
-          text: `bot_send → ${bot} ok (content_len=${content.length})`,
+          text: `bot_send → ${bot} ok (content_len=${content.length})` +
+            (col.mid ? `  mid=${col.mid} thread=${col.thread_id} hops=${col.hops ?? 0}` +
+                       `  — quote mid as reply_to to keep the thread` : ''),
+        }],
+      }
+    }
+
+    // ── COLLABORATION: room_send / room / peer_history (v0.2.18) ────────
+    if (name === 'room_send') {
+      const room = String(args.room ?? '').trim()
+      const content = String(args.content ?? '')
+      if (!room) throw new Error('room_send: room required')
+      if (!content) throw new Error('room_send: content required')
+      const r = await broker.roomSend(
+        room, content,
+        args.reply_to ? String(args.reply_to) : undefined,
+        args.thread_id ? String(args.thread_id) : undefined,
+      )
+      if (!r?.ok) throw new Error(`room_send: broker error: ${r?.error || 'unknown'}`)
+      const c = r.collab || {}
+      // Delivered, queued and failed are three different outcomes and the next
+      // decision depends on which — never collapse them into "ok".
+      const parts = [`room_send → ${room} ok`]
+      if ((c.delivered || []).length) parts.push(`delivered to ${c.delivered.join(', ')}`)
+      if ((c.queued || []).length) parts.push(`QUEUED (offline) for ${c.queued.join(', ')}`)
+      if ((c.failed || []).length) parts.push(`FAILED for ${c.failed.join(', ')}`)
+      parts.push(`mid=${c.mid} thread=${c.thread_id} hops=${c.hops ?? 0}`)
+      return { content: [{ type: 'text', text: parts.join(' · ') }] }
+    }
+
+    if (name === 'room') {
+      const action = String(args.action ?? '').trim()
+      const room = args.room ? String(args.room).trim() : ''
+      if (action === 'join' && !room) throw new Error('room: join needs a room')
+      const cmd = action === 'join' ? 'room_join'
+        : action === 'leave' ? 'room_leave'
+        : action === 'list' ? 'room_list'
+        : ''
+      if (!cmd) throw new Error("room: action must be 'join', 'leave' or 'list'")
+      const r = await broker.roomCmd(cmd, room, args.topic ? String(args.topic) : undefined)
+      if (!r?.ok) throw new Error(`room ${action}: broker error: ${r?.error || 'unknown'}`)
+      return { content: [{ type: 'text', text: JSON.stringify(r.collab ?? {}, null, 2) }] }
+    }
+
+    if (name === 'peer_history') {
+      const opts: Record<string, unknown> = {}
+      for (const k of ['room', 'peer', 'thread_id', 'since']) {
+        if (args[k]) opts[k] = String(args[k])
+      }
+      if (args.limit) opts.limit = Number(args.limit)
+      const r = await broker.peerHistory(opts)
+      if (!r?.ok) throw new Error(`peer_history: broker error: ${r?.error || 'unknown'}`)
+      const h = r.collab || {}
+      const lines = (h.messages || []).map((m: any) =>
+        `[${m.ts}] ${m.direction === 'inbound' ? (m.peer || '?') + ' → ' + (m.bot || '?')
+                                               : (m.bot || '?') + ' → ' + (m.peer || '?')}` +
+        (m.room ? ` (room ${m.room})` : '') +
+        (m.mid ? ` mid=${m.mid}` : '') +
+        (m.thread_id ? ` thread=${m.thread_id}` : '') +
+        `\n${m.content || ''}`)
+      return {
+        content: [{
+          type: 'text',
+          text: lines.length
+            ? `${h.n} message(s):\n\n` + lines.join('\n\n')
+            : 'no messages in scope (you only see conversations you took part in, ' +
+              'and rooms you have joined)',
         }],
       }
     }
