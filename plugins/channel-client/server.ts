@@ -295,6 +295,13 @@ class BrokerClient {
   // caller re-derive it from raw fields.
   lastPongAt = 0        // Date.now() of the last ok pong; 0 = never
   lastConnectedAt = 0   // Date.now() of the last successful connect
+  // What the BROKER says this connection is entitled to (register response).
+  // Used only to decide which tools to LIST — every one of them is enforced
+  // server-side as well, because a bot with a shell can speak this protocol
+  // directly and never load this plugin at all.
+  serverCapabilities: string[] = []
+  private capsResolve: ((v: string[]) => void) | null = null
+  private capsPromise: Promise<string[]> = new Promise(res => { this.capsResolve = res })
 
   // HTML-plane state — pages currently bound (replayed on reconnect).
   pages = new Set<string>()
@@ -450,6 +457,15 @@ class BrokerClient {
       }
       if (SESSION_ID) registerFrame.session_id = SESSION_ID
       this.sendRaw(registerFrame)
+        .then((r: any) => {
+          this.serverCapabilities = Array.isArray(r?.server_capabilities)
+            ? r.server_capabilities.map((x: any) => String(x)) : []
+          if (this.capsResolve) { this.capsResolve(this.serverCapabilities); this.capsResolve = null }
+          if (this.serverCapabilities.length) {
+            process.stderr.write(
+              `channel-client: broker granted capabilities: ${this.serverCapabilities.join(', ')}\n`)
+          }
+        })
         .catch(err => process.stderr.write(`channel-client: register failed: ${err}\n`))
         .then(() => this.replaySubscriptions())
     })
@@ -1109,6 +1125,20 @@ class BrokerClient {
     return this.sendRaw({ cmd: 'peer_history', ...opts })
   }
 
+  /** Capabilities, waiting up to `ms` for the register round-trip. */
+  async capabilities(ms = 3000): Promise<string[]> {
+    if (this.serverCapabilities.length) return this.serverCapabilities
+    return Promise.race([
+      this.capsPromise,
+      new Promise<string[]>(res => setTimeout(() => res(this.serverCapabilities), ms)),
+    ])
+  }
+
+  // ── 托管模式 (v0.2.19): speak into a managed bot's session as the operator ──
+  async speakAs(target: string, content: string): Promise<any> {
+    return this.sendRaw({ cmd: 'speak_as', target, content })
+  }
+
   // ── Outbound wire helpers — WEIXIN plane (v0.2.13) ───────────────────────
   // Separate cmd from `send` on purpose: WeChat's outbound contract really is
   // different — an opaque peer_id instead of a numeric chat_id, no files /
@@ -1434,7 +1464,9 @@ const mcp = new Server(
   },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  const CAPS = await broker.capabilities()
+  return {
   tools: [
     // ── PRIMARY UNIFIED ──────────────────────────────────────────────────
     {
@@ -1932,8 +1964,46 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'says a reply is POSSIBLE, not that it will arrive.',
       inputSchema: { type: 'object', properties: {} },
     },
-  ],
-}))
+    // ── 托管模式 / digital twin (v0.2.19) ──────────────────────────────────
+    // Listed ONLY when the broker granted the capability at register time (see the
+    // filter below). That is hygiene, not the boundary: the broker re-checks every
+    // call, because a bot with a shell can send this command without any plugin.
+    {
+      name: 'speak_as',
+      description:
+        'Write into a MANAGED bot\'s session as if the operator had sent it — the ' +
+        'stand-in half of 托管模式. Only an enrolled digital twin has this tool, and ' +
+        'only for the bots that operator put in its care.\n\n' +
+        'What it does NOT do, by construction: it cannot send a Telegram message, so it ' +
+        'can never impersonate the operator TO the operator. Anything you want to tell ' +
+        'them yourself goes through your own `reply`, in your own name.\n\n' +
+        'Every call is echoed to the operator on YOUR bot, labelled as a 托管 message, ' +
+        'and recorded in the broker archive before it is delivered — if the archive ' +
+        'cannot be written the send is REFUSED rather than made untraceable.\n\n' +
+        'Refusals that mean different things: `operator_active` — they just wrote to ' +
+        'that bot themselves, so stand down; `turn_limit_exceeded` — you have gone back ' +
+        'and forth too many times without a human, so summarise or ask the operator ' +
+        'rather than answering again (NOT a retry); `managed_disabled` / kill switch — ' +
+        'the operator switched 托管模式 off; `not_managed` / `wrong_twin` — that bot is ' +
+        'not in your care.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target: {
+            type: 'string',
+            description: 'The managed bot: its name or @username, as enrolled.',
+          },
+          content: {
+            type: 'string',
+            description: 'What the operator would have said. Written verbatim.',
+          },
+        },
+        required: ['target', 'content'],
+      },
+    },
+  ].filter(t => t.name !== 'speak_as' || CAPS.includes('speak_as')),
+  }
+})
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const name = req.params.name
@@ -2199,6 +2269,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                        `  — quote mid as reply_to to keep the thread` : ''),
         }],
       }
+    }
+
+    // ── 托管模式: speak_as (v0.2.19) ─────────────────────────────────────
+    if (name === 'speak_as') {
+      const target = String(args.target ?? '').trim()
+      const content = String(args.content ?? '')
+      if (!target) throw new Error('speak_as: target required')
+      if (!content) throw new Error('speak_as: content required')
+      const r = await broker.speakAs(target, content)
+      // Surface the broker's refusal reason verbatim: the reasons are not
+      // interchangeable and several of them mean "stop", not "retry".
+      if (!r?.ok) throw new Error(`speak_as refused: ${r?.error || 'unknown'}`)
+      const m = r.managed || {}
+      const parts = [`spoke as the operator → @${m.target || target}`]
+      parts.push(m.delivered ? 'delivered to its live session'
+                             : `QUEUED — ${m.note || 'the bot is offline'}`)
+      parts.push(m.echoed ? 'echoed to the operator (labelled 托管)'
+                          : 'NOT echoed to the operator — they cannot see this one')
+      parts.push(`turn ${m.turn} · archived as ${m.call_id}`)
+      return { content: [{ type: 'text', text: parts.join(' · ') }] }
     }
 
     // ── COLLABORATION: room_send / room / peer_history (v0.2.18) ────────
